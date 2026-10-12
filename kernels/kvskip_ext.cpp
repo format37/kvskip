@@ -194,6 +194,81 @@ std::vector<at::Tensor> vskip1(const at::Tensor& q, const at::Tensor& k, const a
   return {out, lse, out32, vcount};
 }
 
+namespace {
+void check_f32(const at::Tensor& t, const char* name) {
+  TORCH_CHECK(t.is_cuda() && t.scalar_type() == at::kFloat && t.is_contiguous(), name, " must be contiguous CUDA fp32");
+}
+}  // namespace
+
+// Device-side refresh planner, before the attention pass: fills block_idx / block_cnt, trig,
+// cs_now; updates csum (adds the key at T - 1 if add_token) and age.
+void plan(const at::Tensor& q, const at::Tensor& k, at::Tensor& csum, const at::Tensor& lse_ref,
+          const at::Tensor& cs_ref, const at::Tensor& keep, const at::Tensor& lse_att, at::Tensor& age,
+          const at::Tensor& flags, at::Tensor& cs_now, at::Tensor& trig, at::Tensor& block_idx,
+          at::Tensor& block_cnt, double scale, double delta, int64_t max_age, int64_t local, bool add_token,
+          const c10::optional<at::Tensor>& idx) {
+  TORCH_CHECK(q.is_cuda() && q.scalar_type() == at::kBFloat16 && q.dim() == 3 && q.stride(2) == 1, "q: CUDA bf16 [B, Hq, D]");
+  check_kv(k, "k");
+  const int B = q.size(0), Hq = q.size(1), D = q.size(2), Hkv = k.size(1), T = k.size(2);
+  TORCH_CHECK(D == 128 && Hq == 4 * Hkv, "planner kernels: D = 128, G = 4");
+  check_f32(csum, "csum"); check_f32(lse_ref, "lse_ref"); check_f32(cs_ref, "cs_ref");
+  check_f32(lse_att, "lse_att"); check_f32(cs_now, "cs_now");
+  const int NBC = keep.size(2);
+  TORCH_CHECK((T + kvskip::TILE - 1) / kvskip::TILE <= NBC, "block capacity exceeded");
+  TORCH_CHECK(csum.size(2) == NBC && lse_ref.size(2) == NBC && cs_ref.size(2) == NBC && cs_now.size(2) == NBC &&
+                  block_idx.size(2) == NBC, "capacity mismatch");
+  const c10::cuda::CUDAGuard guard(q.device());
+  kvskip::PlanParams p{};
+  p.q = reinterpret_cast<const __nv_bfloat16*>(q.data_ptr());
+  p.q_sb = q.stride(0); p.q_sh = q.stride(1);
+  p.k = reinterpret_cast<const __nv_bfloat16*>(k.data_ptr());
+  p.k_sb = k.stride(0); p.k_sh = k.stride(1); p.k_st = k.stride(2);
+  p.csum = csum.data_ptr<float>();
+  p.lse_ref = lse_ref.data_ptr<float>();
+  p.cs_ref = cs_ref.data_ptr<float>();
+  p.keep = keep.data_ptr<uint8_t>();
+  p.lse_att = lse_att.data_ptr<float>();
+  p.age = age.data_ptr<int>();
+  p.flags = flags.data_ptr<int>();
+  if (idx.has_value()) {
+    TORCH_CHECK(idx->is_cuda() && idx->scalar_type() == at::kByte && idx->is_contiguous() &&
+                    idx->size(0) == B && idx->size(1) == NBC, "idx: contiguous uint8 [B, NBC]");
+    p.idx = idx->data_ptr<uint8_t>();
+  }
+  p.cs_now = cs_now.data_ptr<float>();
+  p.trig = trig.data_ptr<uint8_t>();
+  p.block_idx = block_idx.data_ptr<int>();
+  p.block_cnt = block_cnt.data_ptr<int>();
+  p.B = B; p.Hq = Hq; p.Hkv = Hkv; p.T = T; p.NBC = NBC;
+  p.local = local; p.max_age = max_age; p.add_token = add_token;
+  p.scale = static_cast<float>(scale); p.delta = static_cast<float>(delta);
+  kvskip::launch_plan(p, at::cuda::getCurrentCUDAStream());
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+// Device-side refresh planner, after the attention pass (block stats of that pass).
+void update(const at::Tensor& blk_max, const at::Tensor& blk_sum, const at::Tensor& trig, const at::Tensor& cs_now,
+            at::Tensor& keep, at::Tensor& lse_ref, at::Tensor& cs_ref, at::Tensor& lse_att, int64_t T,
+            double level, int64_t local) {
+  check_f32(blk_max, "blk_max"); check_f32(blk_sum, "blk_sum");
+  const int B = keep.size(0), Hkv = keep.size(1), NBC = keep.size(2), Hq = lse_att.size(1);
+  TORCH_CHECK(blk_max.size(2) == (T + kvskip::TILE - 1) / kvskip::TILE, "stats length mismatch");
+  const c10::cuda::CUDAGuard guard(keep.device());
+  kvskip::UpdateParams p{};
+  p.blk_max = blk_max.data_ptr<float>();
+  p.blk_sum = blk_sum.data_ptr<float>();
+  p.trig = trig.data_ptr<uint8_t>();
+  p.cs_now = cs_now.data_ptr<float>();
+  p.keep = keep.data_ptr<uint8_t>();
+  p.lse_ref = lse_ref.data_ptr<float>();
+  p.cs_ref = cs_ref.data_ptr<float>();
+  p.lse_att = lse_att.data_ptr<float>();
+  p.B = B; p.Hq = Hq; p.Hkv = Hkv; p.T = T; p.NBC = NBC; p.local = local;
+  p.level = static_cast<float>(level);
+  kvskip::launch_update(p, at::cuda::getCurrentCUDAStream());
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
 void read_bw(const at::Tensor& x, at::Tensor& out, int64_t blocks) {
   TORCH_CHECK(x.is_cuda() && x.is_contiguous() && x.nbytes() % 16 == 0, "x: contiguous CUDA, 16-byte multiple");
   kvskip::launch_read(x.data_ptr(), x.nbytes(), reinterpret_cast<uint32_t*>(out.data_ptr()), blocks,
@@ -202,6 +277,12 @@ void read_bw(const at::Tensor& x, at::Tensor& out, int64_t blocks) {
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("read_bw", &read_bw, "streaming read of x (bandwidth ceiling)");
+  m.def("plan", &plan, "device-side refresh planner: decision + block lists (before the pass)",
+        py::arg("q"), py::arg("k"), py::arg("csum"), py::arg("lse_ref"), py::arg("cs_ref"), py::arg("keep"),
+        py::arg("lse_att"), py::arg("age"), py::arg("flags"), py::arg("cs_now"), py::arg("trig"),
+        py::arg("block_idx"), py::arg("block_cnt"), py::arg("scale"), py::arg("delta"), py::arg("max_age"),
+        py::arg("local"), py::arg("add_token"), py::arg("idx") = py::none());
+  m.def("update", &update, "device-side refresh planner: stored set + references (after the pass)");
   m.def("vskip1", &vskip1, "kvskip single-pass V-skip (sink-anchored bound)", py::arg("q"), py::arg("k"),
         py::arg("v"), py::arg("scale"), py::arg("tau"), py::arg("local") = 2, py::arg("num_splits") = 1,
         py::arg("want_f32") = false, py::arg("count") = false, py::arg("lse_prev") = py::none());

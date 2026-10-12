@@ -30,14 +30,15 @@ def ext():
     if _EXT is None:
         from torch.utils.cpp_extension import load
         os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "8.9")
-        build = HERE / "build"
+        build = Path(os.environ.get("KVSKIP_BUILD", HERE / "build"))
         build.mkdir(exist_ok=True)
         verbose = bool(os.environ.get("KVSKIP_VERBOSE"))
         cuda_flags = ["-O3", "-lineinfo", "--use_fast_math"]
         if verbose:
             cuda_flags.append("-Xptxas=-v")
         _EXT = load(name="kvskip_ext",
-                    sources=[str(HERE / "kvskip_ext.cpp"), str(HERE / "kvskip_kernel.cu")],
+                    sources=[str(HERE / "kvskip_ext.cpp"), str(HERE / "kvskip_kernel.cu"),
+                             str(HERE / "kvskip_planner.cu")],
                     extra_cflags=["-O3"], extra_cuda_cflags=cuda_flags,
                     build_directory=str(build), verbose=verbose)
     return _EXT
@@ -179,13 +180,15 @@ def vskip_two_pass(q, k, v, scale: float, rule: str = "topp", value: float = 0.9
 
 
 def vskip_one_pass(q, k, v, scale: float, tau: float = 1e-4, local: int = 2, num_splits: int | None = None,
-                   out_f32: bool = False, count: bool = False, lse_prev: torch.Tensor | None = None) -> dict:
+                   out_f32: bool = False, count: bool = False, lse_prev: torch.Tensor | None = None,
+                   sync: bool = True) -> dict:
     """Single-pass V-skip: K read once, V of a block read only if some head of the
     group has estimated weight >= tau there. The normaliser estimate is lse_prev
     (the previous decode step's log-sum-exp per query head, e.g. this call's "lse"
     output one step earlier) if given; otherwise every CTA bounds it from below
     with the sink block's log-sum-exp, which makes the rule conservative (it keeps
-    every block the oracle "weight >= tau" rule keeps) but skips less."""
+    every block the oracle "weight >= tau" rule keeps) but skips less. With count=True
+    "v_tiles" [B, Hkv] counts the V tiles loaded (and "kept_frac" with sync=True)."""
     if q.dim() == 4:
         q = q.squeeze(2)
     B, Hq, D = q.shape
@@ -200,5 +203,6 @@ def vskip_one_pass(q, k, v, scale: float, tau: float = 1e-4, local: int = 2, num
         d["out_f32"] = o32
     if count:
         d["v_tiles"] = cnt
-        d["kept_frac"] = (cnt.sum() / (B * Hkv * nb)).item()
+        if sync:
+            d["kept_frac"] = (cnt.sum() / (B * Hkv * nb)).item()
     return d

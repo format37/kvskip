@@ -22,7 +22,19 @@ misses exceeds delta. Both read only per-block key centroids (1/64 of K):
         (exact block log-sum-exp of the refresh step, moved by the query drift
         projected on the centroid); the attended part is exact (the masked pass
         knows its own m and l).
+"estp" (stage 3) is estd with the trigger decided before the attention pass: the
+attended set's log-sum-exp in the estimate is the previous step's (over the current
+stored set), so a kernel can choose dense or masked per head before reading K.
 Layers in `dense_layers` are always dense (layer 0 per the stage-1 finding).
+Heads in `index_heads` (stage 3) attend, on every step, the blocks holding an earlier
+occurrence of the current token or the token right after one (duplicate-token and
+induction targets, found by token-id lookup without K) + sink + local blocks, and
+never refresh.
+
+With token ids available (STATE.ids) every record also carries the token-index
+diagnostics: block mass covered by that index set (min over the G heads), the
+token-level mass on its positions, and the mass on token classes (same token as the
+current one, right after one, special tokens, newline tokens, sink block, local blocks).
 
 Every step and layer records per KV head: mass covered by the blocks actually
 used (min / mean over the G heads), the mass the stale set would have covered,
@@ -55,6 +67,9 @@ class ReuseConfig:
     refresh: str = "exact"            # exact | masked
     dense_layers: tuple = (0,)
     dense_heads: tuple = ()           # (layer, kv_head) pairs that refresh (= exact) on every step
+    index_heads: tuple = ()           # (layer, kv_head) pairs on the token index (stage 3)
+    index_kind: str = "token"         # token | bigram: the index the index heads use
+    index_union: bool = False         # index heads attend stored set + index blocks and keep the trigger
     diag: bool = True                 # compute the miss estimates even when the policy does not use them
 
     def name(self) -> str:
@@ -74,6 +89,9 @@ class ReuseConfig:
             tag += f"_{self.refresh}"
         if self.dense_heads:
             tag += f"_dh{len(self.dense_heads)}"
+        if self.index_heads:
+            tag += (f"_ix{'u' if self.index_union else ''}{len(self.index_heads)}"
+                    + ("b" if self.index_kind == "bigram" else ""))
         return tag
 
 
@@ -150,31 +168,92 @@ def est_miss(est_lse, attended_lse, unsel):
     return torch.sigmoid(out - attended_lse).amax(-1)
 
 
+DIAG_KEYS = ("miss_p", "idx_cov", "idx_tok", "idx_kept", "idx2_cov", "idx2_tok", "idx2_kept", "m_same", "m_after",
+             "m_special", "m_newline", "m_sink", "m_local")
+
+
+def token_index(ids: torch.Tensor, T: int, bigram: bool = False):
+    """Positions an index on token ids finds for the current token ids[T-1]: earlier
+    occurrences (duplicate-token target) and the positions right after them (induction
+    target); with bigram=True only occurrences preceded by the previous token ids[T-2]
+    too (an index on token pairs). Returns (same [T], after [T]) bool masks."""
+    x = ids[T - 1]
+    same = torch.zeros(T, dtype=torch.bool, device=ids.device)
+    same[:T - 1] = ids[:T - 1] == x
+    if bigram:
+        prev = torch.zeros_like(same)
+        prev[1:T - 1] = ids[:T - 2] == ids[T - 2]
+        same &= prev
+    after = torch.zeros_like(same)
+    after[1:] = same[:T - 1]
+    return same, after
+
+
+def index_blocks(pos: torch.Tensor, always_row: torch.Tensor) -> torch.Tensor:
+    return (blocks_of(pos.float(), BLOCK, 0.0).amax(-1) > 0) | always_row
+
+
+def index_diag(p, W, ids, vocab, always_row, local: int):
+    """Token-index diagnostics for one layer: p [Hkv, G, T], W [Hkv, G, nb].
+    Returns (diagnostics, token-index blocks [nb], bigram-index blocks [nb])."""
+    Hkv, G, T = p.shape
+    same, after = token_index(ids, T)
+    same2, after2 = token_index(ids, T, bigram=True)
+    pos, pos2 = same | after, same2 | after2
+    idx, idx2 = index_blocks(pos, always_row), index_blocks(pos2, always_row)
+    m = lambda mask: (p * mask).sum(-1).mean(-1)                                # [Hkv], mean over G
+    d = dict(idx_cov=(W * idx).sum(-1).amin(-1), idx_tok=m(pos), m_same=m(same), m_after=m(after),
+             idx_kept=idx.float().mean().expand(Hkv),
+             idx2_cov=(W * idx2).sum(-1).amin(-1), idx2_tok=m(pos2), idx2_kept=idx2.float().mean().expand(Hkv),
+             m_sink=W[..., 0].mean(-1), m_local=W[..., -local:].sum(-1).mean(-1))
+    if vocab is not None:
+        tok = ids[:T]
+        d["m_special"] = m(vocab["special"][tok])
+        d["m_newline"] = m(vocab["newline"][tok])
+    return d, idx, idx2
+
+
 def apply(cfg: ReuseConfig, states: dict, records: dict, s, p, q, layer: int, step: int, k=None,
-          scaling: float = 1.0):
-    """s, p [Hkv, G, T] exact fp32 scores/probs, q [Hkv, G, D], k [Hkv, T, D] fp32.
+          scaling: float = 1.0, ids=None, vocab=None):
+    """s, p [Hkv, G, T] exact fp32 scores/probs, q [Hkv, G, D], k [Hkv, T, D] fp32,
+    ids [>= T] token ids of the sequence (optional: token-index diagnostics / index heads).
     Returns the probs to use."""
     Hkv, G, T = s.shape
     nb = math.ceil(T / BLOCK)
     dev = s.device
     ones = torch.ones(Hkv, device=dev)
     zeros = torch.zeros(Hkv, device=dev)
+    diag = {key: zeros for key in DIAG_KEYS}
+    idx = None
+    W = metrics.block_weights(p)                                   # [Hkv, G, nb]
+    always_row = torch.zeros(nb, dtype=torch.bool, device=dev)
+    always_row[0] = True
+    always_row[-cfg.local:] = True
+    if ids is not None:
+        d, idx, idx2 = index_diag(p, W, ids, vocab, always_row, cfg.local)
+        diag.update(d)
+        if cfg.index_kind == "bigram":
+            idx = idx2
     if layer in cfg.dense_layers:
         records[layer] = dict(covered_min=ones, covered_mean=ones, covered_stale_min=ones, kept=ones,
                               refresh=torch.ones(Hkv, dtype=torch.bool, device=dev),
-                              drift=zeros, age=zeros, miss_c=zeros, miss_d=zeros)
+                              drift=zeros, age=zeros, miss_c=zeros, miss_d=zeros, **diag)
         return p
     if cfg.mode in VSKIP_MODES:
-        return vskip(cfg, states, records, s, p, layer)
+        out = vskip(cfg, states, records, s, p, layer)
+        records[layer].update(diag)
+        return out
 
-    W = metrics.block_weights(p)                                   # [Hkv, G, nb]
     fresh = metrics.needed_blocks(W, cfg.level).any(1)            # [Hkv, nb] union top-p
-    always = torch.zeros(Hkv, nb, dtype=torch.bool, device=dev)
-    always[:, 0] = True
-    always[:, -cfg.local:] = True
+    always = always_row.expand(Hkv, nb)
+    ix = [h for (l, h) in cfg.index_heads if l == layer]
+    assert not ix or idx is not None, "index heads need token ids"
+    extra = torch.zeros(Hkv, nb, dtype=torch.bool, device=dev)    # index blocks joining the set
+    if ix and cfg.index_union:
+        extra[ix] = idx
     qn = F.normalize(q, dim=-1)
 
-    need_est = cfg.diag or cfg.mode in ("estc", "estd")
+    need_est = cfg.diag or cfg.mode in ("estc", "estd", "estp")
     if need_est:
         cs, log_n = centroid_scores(q, k, scaling)                 # [Hkv, G, nb], [nb]
         lse_now = block_lse(s)                                     # exact, used only on refresh
@@ -186,7 +265,7 @@ def apply(cfg: ReuseConfig, states: dict, records: dict, s, p, q, layer: int, st
         refresh = torch.ones(Hkv, dtype=torch.bool, device=dev)
         stored = fresh
         age = torch.zeros(Hkv, dtype=torch.long, device=dev)
-        drift, miss_c, miss_d = zeros, zeros, zeros
+        drift, miss_c, miss_d, miss_p = zeros, zeros, zeros, zeros
         covered_stale = torch.ones(Hkv, device=dev)
         qn_ref = qn
         lse_ref, cs_ref = lse_now, cs
@@ -195,7 +274,7 @@ def apply(cfg: ReuseConfig, states: dict, records: dict, s, p, q, layer: int, st
         age = st["age"] + 1
         qn_ref = st["qn_ref"]
         drift = (1.0 - (qn * qn_ref).sum(-1)).amax(-1)                       # [Hkv]
-        stale = stored | always
+        stale = stored | always | extra
         covered_stale = (W * stale[:, None, :]).sum(-1).amin(-1)            # [Hkv]
         # cheap estimates of the mass the stale set misses (blocks of the refresh
         # step only; newer blocks are always inside the local window)
@@ -208,8 +287,9 @@ def apply(cfg: ReuseConfig, states: dict, records: dict, s, p, q, layer: int, st
             miss_c = est_miss(log_n + cs, attended, unsel)
             est_d = F.pad(st["lse_ref"] + cs[..., :nbr] - st["cs_ref"], (0, nb - nbr), value=float("-inf"))
             miss_d = est_miss(est_d, attended, unsel)
+            miss_p = est_miss(est_d, st["lse_att"], unsel)       # attended part from the previous step
         else:
-            miss_c = miss_d = zeros
+            miss_c = miss_d = miss_p = zeros
         lse_ref, cs_ref = st["lse_ref"], st["cs_ref"]
         if cfg.mode == "fresh":
             refresh = torch.ones(Hkv, dtype=torch.bool, device=dev)
@@ -223,6 +303,8 @@ def apply(cfg: ReuseConfig, states: dict, records: dict, s, p, q, layer: int, st
             refresh = miss_c > cfg.delta
         elif cfg.mode == "estd":
             refresh = miss_d > cfg.delta
+        elif cfg.mode == "estp":
+            refresh = miss_p > cfg.delta
         else:
             raise ValueError(cfg.mode)
         if cfg.max_age:
@@ -236,20 +318,27 @@ def apply(cfg: ReuseConfig, states: dict, records: dict, s, p, q, layer: int, st
         on_refresh = fresh | always
     else:
         on_refresh = torch.ones_like(fresh)
-    sel_now = torch.where(refresh[:, None], on_refresh, stored | always)
+    sel_now = torch.where(refresh[:, None], on_refresh, stored | always | extra)
+    if ix and not cfg.index_union:  # token-index heads: the index set alone, never a refresh
+        refresh = refresh.clone()
+        refresh[ix] = False
+        sel_now = sel_now.clone()
+        sel_now[ix] = idx
 
     r3 = refresh[:, None, None]
     if lse_ref.shape[-1] < nb:      # a new block appeared since the refresh step
         lse_ref = F.pad(lse_ref, (0, nb - lse_ref.shape[-1]), value=float("-inf"))
         cs_ref = F.pad(cs_ref, (0, nb - cs_ref.shape[-1]), value=0.0)
-    states[layer] = dict(sel=torch.where(refresh[:, None], fresh, stored),
-                         age=torch.where(refresh, torch.zeros_like(age), age),
-                         qn_ref=torch.where(r3, qn, qn_ref),
+    sel_next = torch.where(refresh[:, None], fresh, stored)
+    lse_att = lse_now.masked_fill(~(sel_next | always)[:, None, :], float("-inf")).logsumexp(-1)   # [Hkv, G]
+    states[layer] = dict(sel=sel_next, age=torch.where(refresh, torch.zeros_like(age), age),
+                         qn_ref=torch.where(r3, qn, qn_ref), lse_att=lse_att,
                          lse_ref=torch.where(r3, lse_now, lse_ref), cs_ref=torch.where(r3, cs, cs_ref))
     covered = (W * sel_now[:, None, :]).sum(-1)                   # [Hkv, G]
+    diag["miss_p"] = miss_p
     records[layer] = dict(covered_min=covered.amin(-1), covered_mean=covered.mean(-1),
                           covered_stale_min=covered_stale, kept=sel_now.float().mean(-1),
-                          refresh=refresh, drift=drift, age=age.float(), miss_c=miss_c, miss_d=miss_d)
+                          refresh=refresh, drift=drift, age=age.float(), miss_c=miss_c, miss_d=miss_d, **diag)
     if bool(sel_now.all()):
         return p
     drop = (~sel_now).repeat_interleave(BLOCK, dim=-1)[:, :T]     # [Hkv, T]

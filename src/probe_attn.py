@@ -43,6 +43,8 @@ class ProbeState:
         self.passthrough = None     # None, "sdpa" or "eager": stock HF bf16 decode (noise floor)
         self.reuse = None           # None or reuse.ReuseConfig (A1)
         self.locality = None        # None or reuse.Locality (A2)
+        self.ids = None             # token ids of the sequence so far [T] (stage 3 token index), set by the driver
+        self.vocab = None           # {"special": bool [V], "newline": bool [V]} token classes (stage 3)
         self.reset()
 
     def reset(self):
@@ -100,7 +102,7 @@ def decode_attention(query, key, value, attention_mask, scaling, layer_idx):
         STATE.locality.update(layer_idx, s, p, q, k, scaling)
     if STATE.reuse is not None:
         p = reuse.apply(STATE.reuse, STATE.reuse_state, STATE.reuse_rec, s, p, q, layer_idx, STATE.t,
-                        k=k, scaling=scaling)
+                        k=k, scaling=scaling, ids=STATE.ids, vocab=STATE.vocab)
 
     o = torch.einsum("kgt,ktd->kgd", p, v)
     return o.reshape(1, 1, H, D)

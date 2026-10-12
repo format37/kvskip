@@ -59,8 +59,47 @@ struct Params {
                                // it replaces the sink bound (no prologue; not a guarantee)
 };
 
+// Device-side refresh planner (kvskip_planner.cu), one CTA per (b, kv head), G = 4, D = 128.
+struct PlanParams {
+  const __nv_bfloat16* q;      // [B, Hq, D]
+  int64_t q_sb, q_sh;
+  const __nv_bfloat16* k;      // cache view [B, Hkv, T, D] (the new token at T - 1)
+  int64_t k_sb, k_sh, k_st;
+  float* csum;                 // [B, Hkv, NBC, D] per-block key sums (fp32)
+  const float* lse_ref;        // [B, Hq, NBC] block log-sum-exp at the head's last refresh (-inf: none)
+  const float* cs_ref;         // [B, Hq, NBC] centroid scores q.c_b at that refresh
+  const uint8_t* keep;         // [B, Hkv, NBC] stored set
+  const float* lse_att;        // [B, Hq] previous step's log-sum-exp over the attended set
+  int* age;                    // [B, Hkv] steps since the last refresh (updated)
+  const int* flags;            // [Hkv] bit 0: refresh on every step (always-exact head),
+                               //       bit 1: token-index head (reads idx + sink + local, no refresh),
+                               //       bit 2: index-union head (idx joins the attended set, trigger stays)
+  const uint8_t* idx;          // [B, NBC] this step's token-index blocks (or nullptr without index heads)
+  float* cs_now;               // [B, Hq, NBC] out: this step's centroid scores
+  uint8_t* trig;               // [B, Hkv] out: refresh decision
+  int* block_idx;              // [B, Hkv, NBC] out: blocks to read, ascending
+  int* block_cnt;              // [B, Hkv] out
+  int B, Hq, Hkv, T, NBC, local, max_age, add_token;
+  float scale, delta;
+};
+
+struct UpdateParams {
+  const float* blk_max;        // [B, Hq, nb] stats of this step's pass (-inf / 0 on blocks not read)
+  const float* blk_sum;
+  const uint8_t* trig;         // [B, Hkv]
+  const float* cs_now;         // [B, Hq, NBC]
+  uint8_t* keep;               // [B, Hkv, NBC] updated for refreshing heads
+  float* lse_ref;              // [B, Hq, NBC] updated for refreshing heads
+  float* cs_ref;               // [B, Hq, NBC] updated for refreshing heads
+  float* lse_att;              // [B, Hq] updated for every head
+  int B, Hq, Hkv, T, NBC, local;
+  float level;
+};
+
 void launch_decode(const Params& p, int D, int G, int stages, bool masked, bool stats, bool load_v,
                    cudaStream_t stream);
+void launch_plan(const PlanParams& p, cudaStream_t stream);
+void launch_update(const UpdateParams& p, cudaStream_t stream);
 void launch_pv(const Params& p, int D, int G, cudaStream_t stream);
 void launch_vskip1(const Params& p, int D, int G, cudaStream_t stream);
 int max_smem_bytes(int D, int stages, bool load_v);

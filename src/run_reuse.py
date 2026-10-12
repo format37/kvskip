@@ -27,17 +27,26 @@ from run_collect import greedy_token
 
 OUT = common.ROOT / "results" / "reuse"
 REC_KEYS = ("covered_min", "covered_mean", "covered_stale_min", "kept", "refresh", "drift", "age",
-            "miss_c", "miss_d")
+            "miss_c", "miss_d") + reuse.DIAG_KEYS
 
 
 def parse_cond(spec: str) -> ReuseConfig:
-    """mode[:value[:max_age]][:masked][:dh=L.H,L.H...], e.g. fresh, timer:16, oracle:0.98:32,
-    estd:0.02:32, timer:16:masked, estd:0.02:32:dh=2.5,25.3 (always-exact KV heads)."""
+    """mode[:value[:max_age]][:masked][:dh=L.H,L.H...][:ix=L.H,...|:ixb=L.H,...], e.g. fresh,
+    timer:16, oracle:0.98:32, estd:0.02:32, timer:16:masked, estd:0.02:32:dh=2.5,25.3 (always-
+    exact KV heads), estp:0.05:32:dh=...:ix=2.5 (stage 3: pre-pass trigger, token-index heads;
+    ixb: the same on the token-pair index; ixu / ixub: the index blocks join the stored set and
+    the trigger stays)."""
     parts = spec.split(":")
     mode = parts[0]
     extra = {}
-    if parts[-1].startswith("dh="):
-        extra["dense_heads"] = tuple(tuple(int(x) for x in lh.split(".")) for lh in parts[-1][3:].split(","))
+    while parts[-1].split("=")[0] in ("dh", "ix", "ixb", "ixu", "ixub"):
+        key, val = parts[-1].split("=")
+        heads = tuple(tuple(int(x) for x in lh.split(".")) for lh in val.split(","))
+        extra["dense_heads" if key == "dh" else "index_heads"] = heads
+        if key in ("ixb", "ixub"):
+            extra["index_kind"] = "bigram"
+        if key in ("ixu", "ixub"):
+            extra["index_union"] = True
         parts = parts[:-1]
     if mode == "fresh":
         return ReuseConfig("fresh", **extra)
@@ -63,6 +72,17 @@ def grid(name: str, conds=()) -> list[ReuseConfig]:
     return [parse_cond(c) for c in (conds or GRIDS[name])]
 
 
+def vocab_classes(tok, device, vocab_size: int) -> dict:
+    """Token classes for the stage-3 diagnostics: special tokens and tokens containing a newline
+    (sized to the embedding table, which can be larger than the tokenizer's vocabulary)."""
+    n = len(tok)
+    special = torch.zeros(max(n, vocab_size), dtype=torch.bool)
+    special[sorted(tok.all_special_ids + [i for i in range(n) if tok.convert_ids_to_tokens(i).startswith("<|")])] = True
+    newline = torch.zeros_like(special)
+    newline[:n] = torch.tensor(["\n" in tok.decode([i]) for i in range(n)])
+    return {"special": special.to(device), "newline": newline.to(device)}
+
+
 def kl(ref_lp, lp):
     return (ref_lp.exp() * (ref_lp - lp)).sum(-1)
 
@@ -78,6 +98,8 @@ def decode(model, cache, prefix_len, first, steps, eos_ids, forced=None, cfg=Non
     token = first
     for i in range(steps):
         STATE.t = i
+        IDS[prefix_len + i] = token
+        STATE.ids = IDS[:prefix_len + i + 1]
         logits = common.step(model, token, cache)
         lps.append(torch.log_softmax(logits, -1))
         if cfg is not None:
@@ -92,9 +114,12 @@ def decode(model, cache, prefix_len, first, steps, eos_ids, forced=None, cfg=Non
 def run(model_name, genre, ctx, steps, tok, model, configs, grid_name, with_ref_stats, doc=None):
     """doc: optional document dict (data/docs format) used instead of data/docs/<genre>.json;
     `genre` then only names the outputs."""
+    global IDS
     eos_ids = list(model.generation_config.eos_token_id)
     ids, _ = common.build_prompt(tok, doc if doc is not None else common.load_doc(genre), ctx - steps)
     prefix_len = len(ids) - 1
+    IDS = torch.zeros(prefix_len + steps, dtype=torch.long, device=model.device)
+    IDS[:prefix_len] = torch.tensor(ids[:-1], device=model.device)
     cache = common.prefill(model, ids[:-1])
     first = ids[-1]
     L = model.config.num_hidden_layers
@@ -189,6 +214,7 @@ def main():
     ap.add_argument("--doc", nargs="*", default=[], help="extra documents: data/docs/a4/<name>.json (named by <name>)")
     args = ap.parse_args()
     tok, model = common.load(args.model)
+    STATE.vocab = vocab_classes(tok, model.device, model.config.vocab_size)
     configs = grid(args.grid, args.cond)
     for ctx in args.ctx:
         if args.doc:

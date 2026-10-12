@@ -81,11 +81,15 @@ def run(model_name, genre, ctx, steps, tok, model, args):
     res = {"model": model_name, "genre": genre, "ctx": ctx, "steps": steps, "prompt_tokens": len(ids),
            "conditions": {}}
 
+    tag = f"delta{args.delta:g}_age{args.max_age}_dh{len(args.dense_heads)}"
     conds = [("stock_sdpa_bf16", "sdpa", None), ("kvskip_dense", "kvskip", "dense"),
              ("kvskip_vskip2_topp0.99", "kvskip", "vskip2"),
              (f"kvskip_vskip1_prev_tau{args.tau:g}", "kvskip", "vskip1"),
              (f"kvskip_vskip1_sink_tau{args.tau:g}", "kvskip", "vskip1sink"),
-             (f"kvskip_refresh_delta{args.delta:g}_age{args.max_age}_dh{len(args.dense_heads)}", "kvskip", "refresh")]
+             (f"kvskip_refresh_{tag}", "kvskip", "refresh"),
+             (f"kvskip_refresh_pre_{tag}", "kvskip", "refresh_pre"),       # stage 3: trigger before the pass
+             (f"kvskip_refresh_fused_{tag}", "kvskip", "refresh_fused")]   # stage 3: planner in kernels
+    conds = [c for c in conds if c[1] == "sdpa" or c[2] in args.modes]
     for name, impl, mode in conds:
         model.set_attn_implementation(impl)
         if mode:
@@ -97,17 +101,14 @@ def run(model_name, genre, ctx, steps, tok, model, args):
         match = np.array(toks) == np.array(ref_tok)
         row = {"kl_mean": float(k.mean()), "kl_p95": float(np.quantile(k, 0.95)), "kl_max": float(k.max()),
                "top1_agree": float(match.mean()), "seconds": round(time.perf_counter() - t0, 1)}
-        if mode == "refresh":
-            log = KVSKIP.log
-            read = sum(d.get("blocks_read", 0) for d in log.values())
-            total = sum(d.get("blocks_total", 0) for d in log.values())
-            dense = sum(d.get("dense_heads", 0) for d in log.values())
-            masked = sum(d.get("masked_heads", 0) for d in log.values())
-            row.update(kv_read_frac_sparse_layers=read / total, refresh_rate=dense / max(1, masked))
+        if mode in ("refresh", "refresh_pre", "refresh_fused"):
+            tot = kvskip_attn.log_totals()
+            row.update(kv_read_frac_sparse_layers=tot["blocks_read"] / tot["blocks_total"],
+                       refresh_rate=tot["dense_heads"] / max(1, tot["masked_heads"]))
         res["conditions"][name] = row
         print(f"  {name:34s} KL={row['kl_mean']:.2e} p95={row['kl_p95']:.2e} top1={row['top1_agree']:.3f}"
               + (f" KV read={row['kv_read_frac_sparse_layers']:.3f} refresh={row['refresh_rate']:.3f}"
-                 if mode == "refresh" else "") + f" ({row['seconds']}s)", flush=True)
+                 if "kv_read_frac_sparse_layers" in row else "") + f" ({row['seconds']}s)", flush=True)
     noise = res["conditions"]["stock_sdpa_bf16"]["kl_mean"]
     for r in res["conditions"].values():
         r["kl_x_noise"] = r["kl_mean"] / noise
@@ -124,7 +125,7 @@ def run(model_name, genre, ctx, steps, tok, model, args):
         res["timing"] = tm
     model.set_attn_implementation("probe")
     OUT.mkdir(parents=True, exist_ok=True)
-    (OUT / f"{model_name}_{genre}_{ctx}.json").write_text(json.dumps(res, indent=1))
+    (OUT / f"{model_name}_{genre}_{ctx}{args.tag}.json").write_text(json.dumps(res, indent=1))
     del cache
     torch.cuda.empty_cache()
 
@@ -139,6 +140,9 @@ def main():
     ap.add_argument("--delta", type=float, default=0.05)
     ap.add_argument("--max-age", type=int, default=32)
     ap.add_argument("--dense-heads", nargs="*", default=[], help="always-exact KV heads as layer.head")
+    ap.add_argument("--modes", nargs="+", default=["dense", "vskip2", "vskip1", "vskip1sink", "refresh"],
+                    help="kvskip modes to run (stock SDPA always runs: it is the noise floor)")
+    ap.add_argument("--tag", default="", help="output suffix")
     ap.add_argument("--timing", action="store_true")
     ap.add_argument("--timing-steps", type=int, default=32)
     args = ap.parse_args()
