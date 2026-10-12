@@ -1,0 +1,15 @@
+# weights (bf16 safetensors from HF)
+models/
+.venv/
+__pycache__/
+.ipynb_checkpoints/
+
+# downloaded sources; data/docs/*.json are the exact inputs and are kept
+data/raw/
+
+# raw per-step statistics (regenerate with src/run_collect.py / src/run_ablate.py);
+# results/figures and results/tables are kept
+results/collect/
+results/ablate/
+results/logs/
+results/collect_v2/
