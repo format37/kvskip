@@ -1,0 +1,351 @@
+"""Stage 2, track A: block-selection reuse (A1) and mask locality (A2) inside the probe.
+
+A1 -- what a "K+V-skip with periodic refresh" kernel would compute. Per layer and
+KV head the probe keeps a stored block set:
+  * refresh step: the exact weights of this step give the GQA-union top-p set
+    (`level` of each query head's mass); with refresh="exact" this step itself
+    is computed densely (a kernel does one dense pass that also emits per-block
+    stats), with refresh="masked" the fresh set is applied immediately;
+  * other steps: only stored set + block 0 (sink) + the `local` newest blocks
+    are attended (renormalised over them), i.e. neither K nor V of the other
+    blocks is read.
+Refresh policies: "fresh" (new set every step, K fully read = the two-pass
+V-skip kernel), "timer" (every N steps, all heads at once), "oracle" (a head
+refreshes when its stale set covers < theta of the exact mass -- needs the full
+attention, so it is an upper bound for any trigger) and "drift" (a head
+refreshes when its query moved: max over the G heads of 1 - cos(q, q_at_refresh)
+> delta; costs nothing, the query is in registers anyway).
+"estc" / "estd" refresh a head when a cheap estimate of the mass its stale set
+misses exceeds delta. Both read only per-block key centroids (1/64 of K):
+  estc: block sumexp ~ n_b * exp(q . c_b * scale)          (Jensen lower bound)
+  estd: block sumexp ~ S_b(refresh) * exp((q - q_r) . c_b * scale)
+        (exact block log-sum-exp of the refresh step, moved by the query drift
+        projected on the centroid); the attended part is exact (the masked pass
+        knows its own m and l).
+Layers in `dense_layers` are always dense (layer 0 per the stage-1 finding).
+
+Every step and layer records per KV head: mass covered by the blocks actually
+used (min / mean over the G heads), the mass the stale set would have covered,
+fraction of blocks used, refresh flag, query drift and age of the set.
+
+A2 -- run lengths of union top-p 0.99 masks at block sizes 16/32/64/128 and
+cheaper block rankings (Quest min/max at 64 and at 16/32-token sub-blocks,
+key centroid), accumulated on the exact reference pass.
+"""
+
+import math
+from dataclasses import dataclass, field
+
+import torch
+import torch.nn.functional as F
+
+import metrics
+from metrics import BLOCK
+
+
+@dataclass
+class ReuseConfig:
+    mode: str                         # fresh | timer | oracle | drift | estc | estd | vtau | vsink | vprev | vprev2
+    N: int | None = None              # timer period
+    theta: float | None = None        # oracle: refresh if stale coverage < theta
+    delta: float | None = None        # drift: refresh if 1 - cos > delta; estc/estd: if estimated miss > delta
+    max_age: int | None = None        # refresh anyway after this many steps
+    level: float = 0.99               # top-p mass of the stored set
+    local: int = 2                    # newest blocks always attended
+    refresh: str = "exact"            # exact | masked
+    dense_layers: tuple = (0,)
+    dense_heads: tuple = ()           # (layer, kv_head) pairs that refresh (= exact) on every step
+    diag: bool = True                 # compute the miss estimates even when the policy does not use them
+
+    def name(self) -> str:
+        if self.mode == "fresh":
+            return "fresh"
+        if self.mode in VSKIP_MODES:
+            return f"{self.mode}_tau{self.delta:g}"
+        if self.mode == "timer":
+            tag = f"timer_N{self.N}"
+        elif self.mode == "oracle":
+            tag = f"oracle_theta{self.theta:g}"
+        else:
+            tag = f"{self.mode}_delta{self.delta:g}"
+        if self.max_age:
+            tag += f"_age{self.max_age}"
+        if self.refresh != "exact":
+            tag += f"_{self.refresh}"
+        if self.dense_heads:
+            tag += f"_dh{len(self.dense_heads)}"
+        return tag
+
+
+VSKIP_MODES = ("vtau", "vsink", "vprev", "vprev2")
+
+
+def vskip(cfg: ReuseConfig, states: dict, records: dict, s, p, layer: int):
+    """Single-pass V-skip rules (K is always read in full; the decision for a
+    block's V is taken after its QK, per GQA union, with threshold tau = cfg.delta):
+      vtau   exact block weight < tau                         (oracle, = stage 1 "weight" rule)
+      vsink  exp(lse_b - lse_sink) < tau: the sink block's log-sum-exp is a lower
+             bound of the normaliser that every CTA of a split-K kernel can compute
+             by reading block 0 first, so the rule never drops a block with W >= tau
+      vprev  exp(lse_b - lse_prev) < tau: the previous step's exact normaliser
+      vprev2 the same with a 2-nat safety margin
+    Block 0 and the `local` newest blocks are always kept."""
+    Hkv, G, T = s.shape
+    nb = math.ceil(T / BLOCK)
+    dev = s.device
+    lse_b = block_lse(s)                                           # [Hkv, G, nb]
+    lse = s.logsumexp(-1)                                          # [Hkv, G]
+    key = ("lse_prev", layer)
+    prev = states.get(key)
+    states[key] = lse
+    if cfg.mode == "vtau":
+        skip = lse_b - lse[..., None] < math.log(cfg.delta)
+    elif cfg.mode == "vsink":
+        skip = lse_b - lse_b[..., :1] < math.log(cfg.delta)
+    else:
+        if prev is None:                                           # first step: no estimate yet -> dense
+            skip = torch.zeros(Hkv, G, nb, dtype=torch.bool, device=dev)
+        else:
+            margin = 2.0 if cfg.mode == "vprev2" else 0.0
+            skip = lse_b - prev[..., None] < math.log(cfg.delta) - margin
+    skip = skip.all(1)                                             # union over the G heads
+    skip[:, 0] = False
+    skip[:, -cfg.local:] = False
+    keep = ~skip
+    W = metrics.block_weights(p)
+    covered = (W * keep[:, None, :]).sum(-1)
+    zeros = torch.zeros(Hkv, device=dev)
+    dlse = (lse - prev).abs().amax(-1) if prev is not None else zeros
+    records[layer] = dict(covered_min=covered.amin(-1), covered_mean=covered.mean(-1),
+                          covered_stale_min=covered.amin(-1), kept=keep.float().mean(-1),
+                          refresh=torch.ones(Hkv, dtype=torch.bool, device=dev), drift=dlse,
+                          age=zeros, miss_c=zeros, miss_d=zeros)
+    if bool(keep.all()):
+        return p
+    drop = skip.repeat_interleave(BLOCK, dim=-1)[:, :T]
+    return torch.softmax(s.masked_fill(drop[:, None, :], float("-inf")), dim=-1)
+
+
+def block_lse(s: torch.Tensor) -> torch.Tensor:
+    """log sum exp of the scores in each 64-block: [..., nb]."""
+    return blocks_of(s, BLOCK, float("-inf")).logsumexp(-1)
+
+
+def centroid_scores(q, k, scaling):
+    """q [Hkv, G, D], k [Hkv, T, D] -> (q . block key centroid * scale [Hkv, G, nb], log n_b [nb])."""
+    T = k.shape[1]
+    c = blocks_of(k.transpose(1, 2), BLOCK, 0.0).sum(-1).transpose(1, 2)   # [Hkv, nb, D]
+    nb = c.shape[1]
+    sizes = torch.full((nb,), float(BLOCK), device=k.device)
+    sizes[-1] = T - BLOCK * (nb - 1)
+    c = c / sizes[None, :, None]
+    return torch.einsum("kgd,knd->kgn", q, c) * scaling, sizes.log()
+
+
+def est_miss(est_lse, attended_lse, unsel):
+    """Estimated share of the mass outside the attended set, max over the G heads -> [Hkv].
+
+    est_lse [Hkv, G, nb] per-block estimates, attended_lse [Hkv, G] exact, unsel [Hkv, nb]."""
+    out = est_lse.masked_fill(~unsel[:, None, :], float("-inf")).logsumexp(-1)   # [Hkv, G]
+    return torch.sigmoid(out - attended_lse).amax(-1)
+
+
+def apply(cfg: ReuseConfig, states: dict, records: dict, s, p, q, layer: int, step: int, k=None,
+          scaling: float = 1.0):
+    """s, p [Hkv, G, T] exact fp32 scores/probs, q [Hkv, G, D], k [Hkv, T, D] fp32.
+    Returns the probs to use."""
+    Hkv, G, T = s.shape
+    nb = math.ceil(T / BLOCK)
+    dev = s.device
+    ones = torch.ones(Hkv, device=dev)
+    zeros = torch.zeros(Hkv, device=dev)
+    if layer in cfg.dense_layers:
+        records[layer] = dict(covered_min=ones, covered_mean=ones, covered_stale_min=ones, kept=ones,
+                              refresh=torch.ones(Hkv, dtype=torch.bool, device=dev),
+                              drift=zeros, age=zeros, miss_c=zeros, miss_d=zeros)
+        return p
+    if cfg.mode in VSKIP_MODES:
+        return vskip(cfg, states, records, s, p, layer)
+
+    W = metrics.block_weights(p)                                   # [Hkv, G, nb]
+    fresh = metrics.needed_blocks(W, cfg.level).any(1)            # [Hkv, nb] union top-p
+    always = torch.zeros(Hkv, nb, dtype=torch.bool, device=dev)
+    always[:, 0] = True
+    always[:, -cfg.local:] = True
+    qn = F.normalize(q, dim=-1)
+
+    need_est = cfg.diag or cfg.mode in ("estc", "estd")
+    if need_est:
+        cs, log_n = centroid_scores(q, k, scaling)                 # [Hkv, G, nb], [nb]
+        lse_now = block_lse(s)                                     # exact, used only on refresh
+    else:
+        cs = lse_now = torch.zeros(Hkv, G, nb, device=dev)
+
+    st = states.get(layer)
+    if st is None:
+        refresh = torch.ones(Hkv, dtype=torch.bool, device=dev)
+        stored = fresh
+        age = torch.zeros(Hkv, dtype=torch.long, device=dev)
+        drift, miss_c, miss_d = zeros, zeros, zeros
+        covered_stale = torch.ones(Hkv, device=dev)
+        qn_ref = qn
+        lse_ref, cs_ref = lse_now, cs
+    else:
+        stored = F.pad(st["sel"], (0, nb - st["sel"].shape[-1]), value=False)
+        age = st["age"] + 1
+        qn_ref = st["qn_ref"]
+        drift = (1.0 - (qn * qn_ref).sum(-1)).amax(-1)                       # [Hkv]
+        stale = stored | always
+        covered_stale = (W * stale[:, None, :]).sum(-1).amin(-1)            # [Hkv]
+        # cheap estimates of the mass the stale set misses (blocks of the refresh
+        # step only; newer blocks are always inside the local window)
+        nbr = st["lse_ref"].shape[-1]
+        if need_est:
+            attended = s.masked_fill(~stale.repeat_interleave(BLOCK, -1)[:, None, :T],
+                                     float("-inf")).logsumexp(-1)
+            unsel = ~stale
+            unsel[:, nbr:] = False
+            miss_c = est_miss(log_n + cs, attended, unsel)
+            est_d = F.pad(st["lse_ref"] + cs[..., :nbr] - st["cs_ref"], (0, nb - nbr), value=float("-inf"))
+            miss_d = est_miss(est_d, attended, unsel)
+        else:
+            miss_c = miss_d = zeros
+        lse_ref, cs_ref = st["lse_ref"], st["cs_ref"]
+        if cfg.mode == "fresh":
+            refresh = torch.ones(Hkv, dtype=torch.bool, device=dev)
+        elif cfg.mode == "timer":
+            refresh = torch.full((Hkv,), step % cfg.N == 0, dtype=torch.bool, device=dev)
+        elif cfg.mode == "oracle":
+            refresh = covered_stale < cfg.theta
+        elif cfg.mode == "drift":
+            refresh = drift > cfg.delta
+        elif cfg.mode == "estc":
+            refresh = miss_c > cfg.delta
+        elif cfg.mode == "estd":
+            refresh = miss_d > cfg.delta
+        else:
+            raise ValueError(cfg.mode)
+        if cfg.max_age:
+            refresh = refresh | (age >= cfg.max_age)
+        forced = [h for (l, h) in cfg.dense_heads if l == layer]
+        if forced:
+            refresh = refresh.clone()
+            refresh[forced] = True
+
+    if cfg.mode == "fresh" or cfg.refresh == "masked":
+        on_refresh = fresh | always
+    else:
+        on_refresh = torch.ones_like(fresh)
+    sel_now = torch.where(refresh[:, None], on_refresh, stored | always)
+
+    r3 = refresh[:, None, None]
+    if lse_ref.shape[-1] < nb:      # a new block appeared since the refresh step
+        lse_ref = F.pad(lse_ref, (0, nb - lse_ref.shape[-1]), value=float("-inf"))
+        cs_ref = F.pad(cs_ref, (0, nb - cs_ref.shape[-1]), value=0.0)
+    states[layer] = dict(sel=torch.where(refresh[:, None], fresh, stored),
+                         age=torch.where(refresh, torch.zeros_like(age), age),
+                         qn_ref=torch.where(r3, qn, qn_ref),
+                         lse_ref=torch.where(r3, lse_now, lse_ref), cs_ref=torch.where(r3, cs, cs_ref))
+    covered = (W * sel_now[:, None, :]).sum(-1)                   # [Hkv, G]
+    records[layer] = dict(covered_min=covered.amin(-1), covered_mean=covered.mean(-1),
+                          covered_stale_min=covered_stale, kept=sel_now.float().mean(-1),
+                          refresh=refresh, drift=drift, age=age.float(), miss_c=miss_c, miss_d=miss_d)
+    if bool(sel_now.all()):
+        return p
+    drop = (~sel_now).repeat_interleave(BLOCK, dim=-1)[:, :T]     # [Hkv, T]
+    return torch.softmax(s.masked_fill(drop[:, None, :], float("-inf")), dim=-1)
+
+
+# ----------------------------------------------------------------------------- A2
+
+LOC_BLOCKS = (16, 32, 64, 128)
+RUN_CAP = 512                         # run-length histograms are clipped here
+
+
+def blocks_of(x: torch.Tensor, bs: int, fill: float) -> torch.Tensor:
+    T = x.shape[-1]
+    nb = math.ceil(T / bs)
+    if nb * bs != T:
+        x = F.pad(x, (0, nb * bs - T), value=fill)
+    return x.reshape(*x.shape[:-1], nb, bs)
+
+
+def run_lengths(mask: torch.Tensor):
+    """mask [R, n] bool -> (lengths, values) of all maximal runs, row by row."""
+    R, n = mask.shape
+    change = torch.ones_like(mask)
+    change[:, 1:] = mask[:, 1:] != mask[:, :-1]
+    starts = change.flatten().nonzero().squeeze(1)
+    ends = torch.cat([starts[1:], torch.tensor([R * n], device=mask.device)])
+    return ends - starts, mask.flatten()[starts]
+
+
+class Locality:
+    """Accumulates A2 statistics over decode steps (per layer, per block size)."""
+
+    def __init__(self, n_layers: int, device):
+        self.L = n_layers
+        z = lambda *shape: torch.zeros(*shape, dtype=torch.float64, device=device)
+        self.acc = {bs: dict(kept_blocks=z(n_layers), blocks=z(n_layers), kept_tokens=z(n_layers),
+                             tokens=z(n_layers), kept_runs=z(n_layers), skip_runs=z(n_layers),
+                             kept_in_long=z(n_layers), skip_in_long=z(n_layers), skipped=z(n_layers),
+                             hist_kept=z(n_layers, RUN_CAP + 1), hist_skip=z(n_layers, RUN_CAP + 1))
+                    for bs in LOC_BLOCKS}
+        self.rank = {k: z(n_layers) for k in ("oracle", "blockmax", "quest64", "quest32", "quest16",
+                                              "centroid", "count")}
+
+    @torch.no_grad()
+    def update(self, layer: int, s, p, q, k, scaling: float):
+        Hkv, G, T = p.shape
+        for bs, a in self.acc.items():
+            W = blocks_of(p, bs, 0.0).sum(-1)                          # [Hkv, G, nb]
+            sel = metrics.needed_blocks(W, 0.99).any(1)               # [Hkv, nb]
+            nb = sel.shape[-1]
+            sizes = torch.full((nb,), float(bs), device=p.device)
+            sizes[-1] = T - bs * (nb - 1)
+            lengths, values = run_lengths(sel)
+            kl, sl = lengths[values], lengths[~values]
+            a["kept_blocks"][layer] += sel.sum()
+            a["blocks"][layer] += sel.numel()
+            a["kept_tokens"][layer] += (sel.float() * sizes).sum()
+            a["tokens"][layer] += Hkv * T
+            a["kept_runs"][layer] += kl.numel()
+            a["skip_runs"][layer] += sl.numel()
+            a["kept_in_long"][layer] += kl[kl >= 4].sum()
+            a["skip_in_long"][layer] += sl[sl >= 4].sum()
+            a["skipped"][layer] += sl.sum()
+            a["hist_kept"][layer] += torch.bincount(kl.clamp(max=RUN_CAP), minlength=RUN_CAP + 1)
+            a["hist_skip"][layer] += torch.bincount(sl.clamp(max=RUN_CAP), minlength=RUN_CAP + 1)
+
+        # Block rankings at block 64 without loading K: blocks needed for 0.99
+        # when blocks are taken in the order of each predictor (per query head).
+        W = metrics.block_weights(p)                                   # [Hkv, G, nb]
+        kt = k.transpose(1, 2)                                         # [Hkv, D, T]
+        qe = q.unsqueeze(2)                                            # [Hkv, G, 1, D]
+
+        def quest(sub):
+            kmax = blocks_of(kt, sub, float("-inf")).amax(-1).transpose(1, 2).unsqueeze(1)
+            kmin = blocks_of(kt, sub, float("inf")).amin(-1).transpose(1, 2).unsqueeze(1)
+            ub = torch.maximum(qe * kmin, qe * kmax).sum(-1) * scaling  # [Hkv, G, nsub]
+            return blocks_of(ub, BLOCK // sub, float("-inf")).amax(-1)  # max over sub-blocks of a 64-block
+
+        centroid = blocks_of(kt, BLOCK, 0.0).sum(-1).transpose(1, 2)     # [Hkv, nb, D] (sum; divide below)
+        sizes = torch.full((W.shape[-1],), float(BLOCK), device=p.device)
+        sizes[-1] = T - BLOCK * (W.shape[-1] - 1)
+        centroid = centroid / sizes[None, :, None]
+        cscore = torch.einsum("kgd,knd->kgn", q, centroid) * scaling
+        preds = {"blockmax": metrics.block_max(s), "quest64": quest(64), "quest32": quest(32),
+                 "quest16": quest(16), "centroid": cscore}
+        self.rank["oracle"][layer] += metrics.needed_blocks(W, 0.99).sum(-1).float().mean()
+        for name, key in preds.items():
+            self.rank[name][layer] += metrics.blocks_to_mass_by(W, key, 0.99).mean()
+        self.rank["count"][layer] += 1
+
+    def to_numpy(self) -> dict:
+        out = {}
+        for bs, a in self.acc.items():
+            for name, t in a.items():
+                out[f"b{bs}_{name}"] = t.cpu().numpy()
+        for name, t in self.rank.items():
+            out[f"rank_{name}"] = t.cpu().numpy()
+        return out

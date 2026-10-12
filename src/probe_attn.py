@@ -11,6 +11,13 @@ the source of statistics:
                            -> drop KV blocks before the softmax (ablation),
                               i.e. renormalise over the kept blocks exactly
                               like a block-sparse kernel that never loads them.
+  * STATE.reuse = reuse.ReuseConfig(...)
+                           -> stage 2 / A1: attend over a block set chosen on
+                              an earlier (refresh) step; the driver sets
+                              STATE.t to the decode step index.
+  * STATE.locality = reuse.Locality(...)
+                           -> stage 2 / A2: mask run lengths, block sizes and
+                              cheap block rankings on the exact weights.
 
 Usage: import probe_attn; probe_attn.register(); then load the model with
 attn_implementation="probe" (or model.set_attn_implementation("probe")).
@@ -25,6 +32,7 @@ from transformers.masking_utils import AttentionMaskInterface, sdpa_mask
 from transformers.models.llama.modeling_llama import eager_attention_forward
 
 import metrics
+import reuse
 from metrics import BLOCK
 
 
@@ -33,6 +41,8 @@ class ProbeState:
         self.collect = False
         self.mask = None            # None or (criterion, tau, scope)
         self.passthrough = None     # None, "sdpa" or "eager": stock HF bf16 decode (noise floor)
+        self.reuse = None           # None or reuse.ReuseConfig (A1)
+        self.locality = None        # None or reuse.Locality (A2)
         self.reset()
 
     def reset(self):
@@ -41,6 +51,9 @@ class ProbeState:
         self.hist = {}              # layer -> accumulated 2D histogram (whole run)
         self.skip = {}              # layer -> (frac blocks dropped, mass dropped) [Hkv, G]
         self.needed = {}            # layer -> deque of the last steps' 0.99-mass block sets
+        self.t = 0                  # decode step index (A1 timer), set by the driver
+        self.reuse_state = {}       # layer -> stored block set, its age and query (A1)
+        self.reuse_rec = {}         # layer -> this step's A1 record
 
     def take_step(self):
         """Return and clear the per-layer records of the last forward."""
@@ -82,6 +95,12 @@ def decode_attention(query, key, value, attention_mask, scaling, layer_idx):
                                  (metrics.block_weights(p) * skip).sum(-1))
         drop = skip.repeat_interleave(BLOCK, dim=-1)[..., :T]
         p = torch.softmax(s.masked_fill(drop, float("-inf")), dim=-1)
+
+    if STATE.locality is not None:
+        STATE.locality.update(layer_idx, s, p, q, k, scaling)
+    if STATE.reuse is not None:
+        p = reuse.apply(STATE.reuse, STATE.reuse_state, STATE.reuse_rec, s, p, q, layer_idx, STATE.t,
+                        k=k, scaling=scaling)
 
     o = torch.einsum("kgt,ktd->kgd", p, v)
     return o.reshape(1, 1, H, D)

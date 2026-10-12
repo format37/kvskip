@@ -1,0 +1,42 @@
+{
+ "ceiling": {
+  "torch_sum_GBs": 890.3154322383324,
+  "copy_GBs": 848.7916581787957,
+  "read_GBs": 955.592381204177
+ },
+ "gpu": "NVIDIA GeForce RTX 4090",
+ "torch": "2.14.1+cu126",
+ "args": {
+  "backends": [
+   "sdpa",
+   "sdpa_all",
+   "fa2",
+   "kvskip"
+  ],
+  "bs": [
+   1,
+   8,
+   32
+  ],
+  "ctx": [
+   8192,
+   32768,
+   65536,
+   131072
+  ],
+  "iters": 50,
+  "splits": [
+   1,
+   2,
+   4,
+   8,
+   16,
+   32,
+   48,
+   64
+  ],
+  "stages": 2,
+  "tag": "dense"
+ },
+ "time": "2026-10-12 22:40"
+}

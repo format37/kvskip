@@ -6,6 +6,8 @@ __pycache__/
 
 # downloaded sources; data/docs/*.json are the exact inputs and are kept
 data/raw/
+# real q/k/v dumps for kernel tests (regenerate with src/dump_kv.py, ~0.5 GB each)
+data/kv_dumps/
 
 # raw per-step statistics (regenerate with src/run_collect.py / src/run_ablate.py);
 # results/figures and results/tables are kept
@@ -13,3 +15,10 @@ results/collect/
 results/ablate/
 results/logs/
 results/collect_v2/
+results/reuse/
+results/ppl/
+results/template/
+results/bench/raw/
+# torch.utils.cpp_extension build dir
+kernels/build/
+results/e2e/
