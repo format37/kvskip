@@ -13,6 +13,8 @@ With --timing it also measures the wall time of a decode step (CUDA events,
 GrowingCache, so no per-step torch.cat) for SDPA and each kvskip mode.
 
 Output: results/e2e/<model>_<genre>_<ctx>.json
+
+Input: data/docs/<genre>.json, models/llama-3.1-8b; the kvskip extension (kernels/, built on first use).
 """
 
 import argparse

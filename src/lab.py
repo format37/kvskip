@@ -24,6 +24,8 @@ Per layer:
      layer: QKV / o_proj / MLP / norms / cache append. "replay" times the kernels of
      "refresh_pre" alone: its recorded block lists, no planner (what a fused planner can
      reach); its outputs equal refresh_pre's, so it has no KL pass of its own.
+     "refresh_cal" (stage 4) is refresh_fused with the online calibration of the estimate
+     (--calib*) instead of the always-exact head list.
 At the end the decode positions' hidden states give logits -> KL vs the exact reference
 (the noise floor is stock SDPA), top-1 agreement with the reference.
 
@@ -33,6 +35,9 @@ checks this composition against the real model where the KV fits (bs=1 at 32k, b
 
 Output: results/lab/<tag>_<ctx>.json (summary) and .npz (per layer and step: times,
 counters).
+
+Input: data/docs/{,a4/,s3/}<doc>.json (the stage-3 documents, src/prepare_s3.py), their teacher
+tokens data/docs/s3/forced.json (src/make_forced.py), models/llama-3.1-8b, the kvskip extension.
 """
 
 import argparse
@@ -67,6 +72,7 @@ CONDS = {
     "refresh_fused": ("kvskip", "refresh_fused"),
     "refresh_pre_ix": ("kvskip", "refresh_pre"),        # --index-heads on the token index, not always exact
     "refresh_fused_ix": ("kvskip", "refresh_fused"),
+    "refresh_cal": ("kvskip", "refresh_fused"),         # stage 4: online calibration, no head list (--calib*)
     "replay": ("kvskip", "replay"),
     "null": ("lab_null", None),
 }
@@ -199,6 +205,12 @@ def set_condition(model, cond, args):
             KVSKIP.index_heads = args.index_heads
             KVSKIP.dense_heads = tuple(h for h in KVSKIP.dense_heads if h not in args.index_heads)
         KVSKIP.dense_layers = (0,)
+        KVSKIP.calib, KVSKIP.calib_kind, KVSKIP.calib_warm, KVSKIP.calib_auto_ix = None, "logit", (), None
+        if cond == "refresh_cal":
+            KVSKIP.dense_heads, KVSKIP.index_heads = (), ()
+            KVSKIP.calib, KVSKIP.calib_kind = args.calib, args.calib_kind
+            KVSKIP.calib_warm, KVSKIP.calib_auto_ix = tuple(args.calib_warm), args.calib_auto_ix
+            KVSKIP.dense_layers = tuple(args.dense_layers)
     KVSKIP.reset()
 
 
@@ -254,7 +266,7 @@ def run(args):
     emb.to("cpu")
     hid = {c: h0.clone() for c in conds if c not in NO_KL}
     idx = None
-    if any(c.endswith("_ix") for c in conds):
+    if any(c.endswith("_ix") for c in conds) or ("refresh_cal" in conds and args.calib_auto_ix is not None):
         idx = index_steps(torch.cat([pre_ids, dec_ids], 1), P, S, bigram=args.index_kind == "bigram")
     hid_null = h0.clone()
     rot = model.model.rotary_emb.to(dev)
@@ -289,7 +301,7 @@ def run(args):
                 x_in = hid[c] if c not in NO_KL else hid_null
                 if c not in UNTIMED:
                     x_keep = x_in.clone()
-            ix = idx if c.endswith("_ix") else None
+            ix = idx if c.endswith("_ix") or (c == "refresh_cal" and args.calib_auto_ix is not None) else None
             if c not in NO_KL:                              # main pass: outputs + byte counters
                 KVSKIP.count, KVSKIP.record = True, c == "refresh_pre"
                 decode_layer(layer, x_in, LabCache(kbuf[:n], vbuf[:n], P), cos, sin, P, idx=ix)
@@ -344,6 +356,8 @@ def run(args):
            "dense_heads": [list(h) for h in DENSE_HEADS] if args.dense_heads else [],
            "index_heads": [list(h) for h in args.index_heads], "index_kind": args.index_kind,
            "index_union": args.index_union,
+           "calib": {"rate": args.calib, "kind": args.calib_kind, "warm": args.calib_warm,
+                     "auto_ix": args.calib_auto_ix, "dense_layers": args.dense_layers},
            "delta": args.delta, "max_age": args.max_age, "tau": args.tau, "warmup": WARMUP,
            "layers": list(layers), "ref_argmax_eq_forced": forced_match, "head_ms": head_ms,
            "prefill_s": round(t_prefill, 1), "total_s": round(time.perf_counter() - t_start, 1),
@@ -403,6 +417,11 @@ def main():
     ap.add_argument("--index-kind", default="token", choices=["token", "bigram"])
     ap.add_argument("--index-union", action="store_true",
                     help="index blocks join the stored set (trigger stays) instead of replacing it")
+    ap.add_argument("--calib", type=float, default=0.05, help="refresh_cal: rate of the online calibration")
+    ap.add_argument("--calib-kind", default="peak", choices=["logit", "add", "peak"])
+    ap.add_argument("--calib-warm", nargs="*", type=int, default=[32, 8], help="W A: max age A in the first W steps")
+    ap.add_argument("--calib-auto-ix", type=float, default=None, help="heads above this correction join the index")
+    ap.add_argument("--dense-layers", nargs="*", type=int, default=[0], help="refresh_cal: dense layers")
     ap.add_argument("--tag", default="s3")
     a = ap.parse_args()
     a.index_heads = tuple(tuple(int(x) for x in lh.split(".")) for lh in a.index_heads)

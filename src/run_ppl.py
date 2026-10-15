@@ -14,6 +14,8 @@ top-p 0.99 every step = two-pass V-skip) and any reuse policy given with --cond
 (src/run_reuse.parse_cond syntax).
 
 Output: results/ppl/<model>_<genre>_<ctx>.{tokens.parquet,summary.json}
+
+Input: data/docs/<genre>.json (src/prepare_data.py), models/<model>.
 """
 
 import argparse

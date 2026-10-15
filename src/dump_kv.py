@@ -11,6 +11,8 @@ Step s of the dump sees the first T_s = prompt_len + s positions of K/V
 (metadata "T"). Queries are post-RoPE, exactly what the attention kernel gets.
 
 Output: data/kv_dumps/<model>_<genre>_<ctx>.safetensors (gitignored, ~0.5 GB each).
+
+Input: data/docs/<genre>.json, models/llama-3.1-8b.
 """
 
 import argparse

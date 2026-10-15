@@ -23,6 +23,14 @@
 //                  (block log-sum-exps, centroid scores); for every head the log-sum-exp of
 //                  this step's block weights over the next step's attended set.
 //
+// Online calibration (stage 4): plan writes its uncorrected estimate and, with calib_on,
+// decides on estimate + c (calib_kind 1, 2) or sigmoid(logit(estimate) + c) (kind 0) for the
+// head's correction c. A refreshing head read every block, so update knows the mass its
+// attended set really missed and moves c towards real - estimate (or the log-odds
+// difference): an EMA (kinds 0, 1) or a decaying maximum max((1 - rate) c, real - estimate)
+// (kind 2); c >= 0 unless calib_free. With aix, a head whose correction exceeds
+// aix_thr is latched onto the token index: its index blocks join the attended set.
+//
 // No host synchronisation: the attention kernel's split count is sized for every block.
 #include "kvskip.h"
 
@@ -48,6 +56,11 @@ __device__ __forceinline__ float pmax(float v) {
 }
 
 __device__ __forceinline__ bool always_block(int blk, int nb, int local) { return blk == 0 || blk >= nb - local; }
+
+__device__ __forceinline__ float clamped_logit(float x) {
+  x = fminf(fmaxf(x, 1e-6f), 1.f - 1e-6f);
+  return __logf(x) - __logf(1.f - x);
+}
 
 __device__ __forceinline__ void lse_push(float& m, float& s, float e) {
   if (e == -INFINITY) return;
@@ -93,7 +106,7 @@ __global__ void __launch_bounds__(PT) plan_kernel(const PlanParams p) {
     return;
   }
 
-  const bool uni = p.flags[h] & 4;         // index-union head: the index blocks join the attended set
+  const bool uni = (p.flags[h] & 4) || (p.aix && p.aix[bh]);   // index-union head: index blocks join the set
   const uint8_t* idx = uni ? p.idx + static_cast<int64_t>(b) * p.NBC : nullptr;
   auto attended = [&](int blk) { return keep[blk] || always_block(blk, nb, p.local) || (uni && idx[blk]); };
 
@@ -177,8 +190,12 @@ __global__ void __launch_bounds__(PT) plan_kernel(const PlanParams p) {
         miss = fmaxf(miss, 1.f / (1.f + __expf(p.lse_att[static_cast<int64_t>(b) * p.Hq + h * PG + g] - est)));
       }
     }
+    if (p.est) p.est[bh] = miss;
+    float dec = miss;
+    if (p.calib && p.calib_on)
+      dec = p.calib_kind ? miss + p.calib[bh] : 1.f / (1.f + __expf(-(clamped_logit(miss) + p.calib[bh])));
     const int a = p.age[bh] + 1;
-    const bool tr = miss > p.delta || a >= p.max_age || (p.flags[h] & 1);
+    const bool tr = dec > p.delta || a >= p.max_age || (p.flags[h] & 1);
     p.age[bh] = tr ? 0 : a;
     p.trig[bh] = tr;
     sTrig = tr;
@@ -230,6 +247,19 @@ __global__ void __launch_bounds__(PT) update_kernel(const UpdateParams p) {
   for (int i = tid; i < nb; i += PT) skeep[i] = 0;
   mx = pmax(mx);
   __syncthreads();
+  __shared__ float sReal[PG];
+  if (tr && p.calib) {                     // the mass the attended set missed (every block was read)
+    const bool uni = (p.flags[h] & 4) || (p.aix && p.aix[bh]);
+    const uint8_t* idx = uni ? p.idx + static_cast<int64_t>(b) * p.NBC : nullptr;
+    float mi = -INFINITY, si = 0.f, mo = -INFINITY, so = 0.f;
+    for (int i = lane; i < nb; i += 32) {
+      if (keep[i] || always_block(i, nb, p.local) || (uni && idx[i])) lse_push(mi, si, x[i]);
+      else lse_push(mo, so, x[i]);
+    }
+    const float Mi = pmax(mi), Si = psum(si > 0.f ? si * __expf(mi - Mi) : 0.f);
+    const float Mo = pmax(mo), So = psum(so > 0.f ? so * __expf(mo - Mo) : 0.f);
+    if (lane == 0) sReal[warp] = So > 0.f ? 1.f / (1.f + __expf((Mi + __logf(Si)) - (Mo + __logf(So)))) : 0.f;
+  }
   if (tr) {
     float se = 0.f;
     for (int i = lane; i < nb; i += 32) se += __expf(x[i] - mx);
@@ -252,6 +282,17 @@ __global__ void __launch_bounds__(PT) update_kernel(const UpdateParams p) {
     }
   }
   __syncthreads();
+  if (tr && p.calib && tid == 0) {
+    float real = 0.f;
+    for (int g = 0; g < PG; ++g) real = fmaxf(real, sReal[g]);
+    const float est = p.est[bh];
+    const float resid = p.calib_kind ? real - est : clamped_logit(real) - clamped_logit(est);
+    float c = p.calib_kind == 2 ? fmaxf((1.f - p.calib_rate) * p.calib[bh], resid)       // peak: decaying max
+                                : (1.f - p.calib_rate) * p.calib[bh] + p.calib_rate * resid;  // EMA
+    if (!p.calib_free) c = fmaxf(c, 0.f);
+    p.calib[bh] = c;
+    if (p.aix && c > p.aix_thr) p.aix[bh] = 1;
+  }
   if (tr)
     for (int i = tid; i < p.NBC; i += PT) keep[i] = i < nb && (skeep[i] || always_block(i, nb, p.local));
   __syncthreads();

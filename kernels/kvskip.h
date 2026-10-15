@@ -75,6 +75,11 @@ struct PlanParams {
                                //       bit 1: token-index head (reads idx + sink + local, no refresh),
                                //       bit 2: index-union head (idx joins the attended set, trigger stays)
   const uint8_t* idx;          // [B, NBC] this step's token-index blocks (or nullptr without index heads)
+  const float* calib;          // [B, Hkv] stage 4: correction of the estimate (nullptr: off)
+  float* est;                  // [B, Hkv] out: the uncorrected estimate (max over the group), or nullptr
+  int calib_on;                // apply the correction on this step
+  int calib_kind;              // 0: log-odds offset (sigmoid(logit(est) + c)); 1, 2: added to the share (est + c)
+  const uint8_t* aix;          // [B, Hkv] heads latched onto the token index (index union), or nullptr
   float* cs_now;               // [B, Hq, NBC] out: this step's centroid scores
   uint8_t* trig;               // [B, Hkv] out: refresh decision
   int* block_idx;              // [B, Hkv, NBC] out: blocks to read, ascending
@@ -92,6 +97,15 @@ struct UpdateParams {
   float* lse_ref;              // [B, Hq, NBC] updated for refreshing heads
   float* cs_ref;               // [B, Hq, NBC] updated for refreshing heads
   float* lse_att;              // [B, Hq] updated for every head
+  const int* flags;            // [Hkv] (bit 2: index union -- idx joins the attended set)
+  const uint8_t* idx;          // [B, NBC] this step's token-index blocks, or nullptr
+  const float* est;            // [B, Hkv] the plan kernel's uncorrected estimate
+  float* calib;                // [B, Hkv] stage 4: EMA of logit(real miss) - logit(est) on refreshing heads
+  float calib_rate;            // EMA rate (calib == nullptr: no learning)
+  int calib_free;              // allow negative corrections
+  int calib_kind;              // 0, 1: EMA of logit(real) - logit(est) / real - est; 2: max((1 - rate) c, real - est)
+  uint8_t* aix;                // [B, Hkv] latched onto the token index once calib > aix_thr (nullptr: off)
+  float aix_thr;
   int B, Hq, Hkv, T, NBC, local;
   float level;
 };

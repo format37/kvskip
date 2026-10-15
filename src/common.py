@@ -1,4 +1,6 @@
-"""Model loading, prompt construction and the prefill/decode loop shared by the runners."""
+"""Model loading, prompt construction and the prefill/decode loop shared by the runners.
+
+Input: models/<name> (bf16 safetensors from Hugging Face, see README) and data/docs/{,a4/,s3/}<name>.json."""
 
 import json
 import os
@@ -17,6 +19,8 @@ MODELS = {
     "1b": ROOT / "models" / "llama-3.2-1b",
     "8b": ROOT / "models" / "llama-3.1-8b",
     "qwen3-8b": ROOT / "models" / "qwen3-8b",
+    "qwen2.5-7b": ROOT / "models" / "qwen2.5-7b",      # stage 4: Qwen2.5-7B-Instruct (no QK-norm)
+    "mistral-7b": ROOT / "models" / "mistral-7b",      # stage 4: Mistral-7B-Instruct-v0.3 (map only)
 }
 GENRES = ("prose", "code", "dialog")
 # Pin the date the chat template injects (Llama 3.2 would otherwise use today's).
@@ -33,6 +37,12 @@ def load(name: str, attn: str = "probe"):
     )
     model.eval()
     return tok, model
+
+
+def eos_ids(model) -> list[int]:
+    """The model's end-of-sequence ids as a list (Mistral's generation config holds one int)."""
+    eos = model.generation_config.eos_token_id
+    return [eos] if isinstance(eos, int) else list(eos)
 
 
 def load_doc(genre: str) -> dict:

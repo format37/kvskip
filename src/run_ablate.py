@@ -13,6 +13,8 @@ x scope {head, union (GQA)}. Noise floor: stock HF bf16 sdpa/eager decode,
 teacher-forced the same way.
 
 Outputs results/ablate/<model>_<genre>_<ctx>.{steps.parquet,layers.parquet,summary.json}
+
+Input: data/docs/<genre>.json (src/prepare_data.py), models/<model>.
 """
 
 import argparse

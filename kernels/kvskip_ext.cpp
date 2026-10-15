@@ -206,7 +206,9 @@ void plan(const at::Tensor& q, const at::Tensor& k, at::Tensor& csum, const at::
           const at::Tensor& cs_ref, const at::Tensor& keep, const at::Tensor& lse_att, at::Tensor& age,
           const at::Tensor& flags, at::Tensor& cs_now, at::Tensor& trig, at::Tensor& block_idx,
           at::Tensor& block_cnt, double scale, double delta, int64_t max_age, int64_t local, bool add_token,
-          const c10::optional<at::Tensor>& idx) {
+          const c10::optional<at::Tensor>& idx, const c10::optional<at::Tensor>& calib,
+          const c10::optional<at::Tensor>& est, bool calib_on, int64_t calib_kind,
+          const c10::optional<at::Tensor>& aix) {
   TORCH_CHECK(q.is_cuda() && q.scalar_type() == at::kBFloat16 && q.dim() == 3 && q.stride(2) == 1, "q: CUDA bf16 [B, Hq, D]");
   check_kv(k, "k");
   const int B = q.size(0), Hq = q.size(1), D = q.size(2), Hkv = k.size(1), T = k.size(2);
@@ -235,6 +237,24 @@ void plan(const at::Tensor& q, const at::Tensor& k, at::Tensor& csum, const at::
                     idx->size(0) == B && idx->size(1) == NBC, "idx: contiguous uint8 [B, NBC]");
     p.idx = idx->data_ptr<uint8_t>();
   }
+  if (calib.has_value()) {
+    check_f32(*calib, "calib");
+    TORCH_CHECK(calib->numel() == static_cast<int64_t>(B) * Hkv, "calib: [B, Hkv]");
+    p.calib = calib->data_ptr<float>();
+  }
+  if (est.has_value()) {
+    check_f32(*est, "est");
+    TORCH_CHECK(est->numel() == static_cast<int64_t>(B) * Hkv, "est: [B, Hkv]");
+    p.est = est->data_ptr<float>();
+  }
+  p.calib_on = calib_on;
+  p.calib_kind = calib_kind;
+  if (aix.has_value()) {
+    TORCH_CHECK(aix->is_cuda() && aix->scalar_type() == at::kByte && aix->is_contiguous() &&
+                    aix->numel() == static_cast<int64_t>(B) * Hkv, "aix: contiguous uint8 [B, Hkv]");
+    TORCH_CHECK(idx.has_value(), "aix needs idx");
+    p.aix = aix->data_ptr<uint8_t>();
+  }
   p.cs_now = cs_now.data_ptr<float>();
   p.trig = trig.data_ptr<uint8_t>();
   p.block_idx = block_idx.data_ptr<int>();
@@ -249,7 +269,10 @@ void plan(const at::Tensor& q, const at::Tensor& k, at::Tensor& csum, const at::
 // Device-side refresh planner, after the attention pass (block stats of that pass).
 void update(const at::Tensor& blk_max, const at::Tensor& blk_sum, const at::Tensor& trig, const at::Tensor& cs_now,
             at::Tensor& keep, at::Tensor& lse_ref, at::Tensor& cs_ref, at::Tensor& lse_att, int64_t T,
-            double level, int64_t local) {
+            double level, int64_t local, const c10::optional<at::Tensor>& flags,
+            const c10::optional<at::Tensor>& idx, const c10::optional<at::Tensor>& est,
+            const c10::optional<at::Tensor>& calib, double calib_rate, bool calib_free, int64_t calib_kind,
+            const c10::optional<at::Tensor>& aix, double aix_thr) {
   check_f32(blk_max, "blk_max"); check_f32(blk_sum, "blk_sum");
   const int B = keep.size(0), Hkv = keep.size(1), NBC = keep.size(2), Hq = lse_att.size(1);
   TORCH_CHECK(blk_max.size(2) == (T + kvskip::TILE - 1) / kvskip::TILE, "stats length mismatch");
@@ -265,6 +288,32 @@ void update(const at::Tensor& blk_max, const at::Tensor& blk_sum, const at::Tens
   p.lse_att = lse_att.data_ptr<float>();
   p.B = B; p.Hq = Hq; p.Hkv = Hkv; p.T = T; p.NBC = NBC; p.local = local;
   p.level = static_cast<float>(level);
+  if (calib.has_value()) {
+    TORCH_CHECK(flags.has_value() && est.has_value(), "calibration needs flags and est");
+    TORCH_CHECK(flags->is_cuda() && flags->scalar_type() == at::kInt && flags->numel() == Hkv, "flags: int32 [Hkv]");
+    check_f32(*est, "est");
+    check_f32(*calib, "calib");
+    TORCH_CHECK(est->numel() == static_cast<int64_t>(B) * Hkv && calib->numel() == static_cast<int64_t>(B) * Hkv,
+                "est / calib: [B, Hkv]");
+    p.flags = flags->data_ptr<int>();
+    p.est = est->data_ptr<float>();
+    p.calib = calib->data_ptr<float>();
+    p.calib_rate = static_cast<float>(calib_rate);
+    p.calib_free = calib_free;
+    p.calib_kind = calib_kind;
+    if (aix.has_value()) {
+      TORCH_CHECK(aix->is_cuda() && aix->scalar_type() == at::kByte && aix->is_contiguous() &&
+                      aix->numel() == static_cast<int64_t>(B) * Hkv, "aix: contiguous uint8 [B, Hkv]");
+      TORCH_CHECK(idx.has_value(), "aix needs idx");
+      p.aix = aix->data_ptr<uint8_t>();
+      p.aix_thr = static_cast<float>(aix_thr);
+    }
+    if (idx.has_value()) {
+      TORCH_CHECK(idx->is_cuda() && idx->scalar_type() == at::kByte && idx->is_contiguous() &&
+                      idx->size(0) == B && idx->size(1) == NBC, "idx: contiguous uint8 [B, NBC]");
+      p.idx = idx->data_ptr<uint8_t>();
+    }
+  }
   kvskip::launch_update(p, at::cuda::getCurrentCUDAStream());
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
@@ -281,8 +330,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("q"), py::arg("k"), py::arg("csum"), py::arg("lse_ref"), py::arg("cs_ref"), py::arg("keep"),
         py::arg("lse_att"), py::arg("age"), py::arg("flags"), py::arg("cs_now"), py::arg("trig"),
         py::arg("block_idx"), py::arg("block_cnt"), py::arg("scale"), py::arg("delta"), py::arg("max_age"),
-        py::arg("local"), py::arg("add_token"), py::arg("idx") = py::none());
-  m.def("update", &update, "device-side refresh planner: stored set + references (after the pass)");
+        py::arg("local"), py::arg("add_token"), py::arg("idx") = py::none(), py::arg("calib") = py::none(),
+        py::arg("est") = py::none(), py::arg("calib_on") = false, py::arg("calib_kind") = 0,
+        py::arg("aix") = py::none());
+  m.def("update", &update, "device-side refresh planner: stored set + references (after the pass)",
+        py::arg("blk_max"), py::arg("blk_sum"), py::arg("trig"), py::arg("cs_now"), py::arg("keep"),
+        py::arg("lse_ref"), py::arg("cs_ref"), py::arg("lse_att"), py::arg("T"), py::arg("level"), py::arg("local"),
+        py::arg("flags") = py::none(), py::arg("idx") = py::none(), py::arg("est") = py::none(),
+        py::arg("calib") = py::none(), py::arg("calib_rate") = 0.0, py::arg("calib_free") = false,
+        py::arg("calib_kind") = 0, py::arg("aix") = py::none(), py::arg("aix_thr") = 0.0);
   m.def("vskip1", &vskip1, "kvskip single-pass V-skip (sink-anchored bound)", py::arg("q"), py::arg("k"),
         py::arg("v"), py::arg("scale"), py::arg("tau"), py::arg("local") = 2, py::arg("num_splits") = 1,
         py::arg("want_f32") = false, py::arg("count") = false, py::arg("lse_prev") = py::none());

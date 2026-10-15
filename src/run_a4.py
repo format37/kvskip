@@ -10,6 +10,8 @@ of every layer and step:
                 <|end_header_id|>, <|eot_id|>) at positions >= 4
   svc_share     share of the prompt's tokens that are service tokens
 Outputs results/template/<model>_<name>_<ctx>.json (per-layer means) and prints a summary.
+
+Input: data/docs/<genre>.json and data/docs/a4/*.json (src/prepare_data.py, src/prepare_a4.py).
 """
 
 import argparse

@@ -6,6 +6,8 @@ Outputs (results/collect/<model>_<genre>_<ctx>.*):
   kv.parquet     one row per (step, layer, kv_head): GQA-union metrics
   hist.npz       per-layer 2D histogram of (pre-exp gap, log10 block weight)
   meta.json      prompt/decode info and the generated text
+
+Input: data/docs/<genre>.json (src/prepare_data.py), models/<model>.
 """
 
 import argparse
@@ -43,7 +45,7 @@ def greedy_token(logits: torch.Tensor, eos_ids: list[int]) -> tuple[int, bool]:
 def run(model_name: str, genre: str, ctx: int, steps: int, tok=None, model=None, out=OUT):
     if model is None:
         tok, model = common.load(model_name)
-    eos_ids = list(model.generation_config.eos_token_id)
+    eos_ids = common.eos_ids(model)
     L = model.config.num_hidden_layers
     ids, n_units = common.build_prompt(tok, common.load_doc(genre), ctx - steps)
 

@@ -8,6 +8,8 @@ same answer keeps the runs comparable. At 64k the question is the same, so the
 32k answer is a plausible continuation there too.
 
 Output: data/docs/s3/forced.json {doc: {"tokens": [...], "text": str}}.
+
+Input: the stage-3 documents (src/prepare_s3.py), models/llama-3.1-8b.
 """
 
 import argparse

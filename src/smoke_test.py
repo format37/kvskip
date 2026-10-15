@@ -3,6 +3,8 @@ implementations (sdpa / eager / probe) and check that they agree.
 
 Also checks the probe decode path numerically: attention output against an
 fp64 reference on real q/k/v, and next-token logits against HF eager/sdpa.
+
+Input: models/llama-3.2-1b, data/docs/prose.json.
 """
 
 import time

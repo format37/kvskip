@@ -9,6 +9,8 @@ probe runs first as the reference and every mode's KL is reported in multiples o
 stock-SDPA noise floor.
 
 Output: results/e2e_s3/<ctx>_bs<B>.json
+
+Input: as src/lab.py (stage-3 documents + data/docs/s3/forced.json), models/llama-3.1-8b.
 """
 
 import argparse

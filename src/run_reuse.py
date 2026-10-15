@@ -8,6 +8,9 @@ KL(ref || cond) per step, top-1 agreement, bytes skipped and per
 
 Outputs results/reuse/<model>_<genre>_<ctx>[.<grid>].{steps.parquet,heads.parquet,summary.json}
 and <model>_<genre>_<ctx>.locality.npz (reference pass only).
+
+Input: data/docs/<genre>.json (src/prepare_data.py) or, with --doc, data/docs/{a4,s3}/<name>.json
+(src/prepare_a4.py, src/prepare_s3.py); models/<model>.
 """
 
 import argparse
@@ -27,39 +30,125 @@ from run_collect import greedy_token
 
 OUT = common.ROOT / "results" / "reuse"
 REC_KEYS = ("covered_min", "covered_mean", "covered_stale_min", "kept", "refresh", "drift", "age",
-            "miss_c", "miss_d") + reuse.DIAG_KEYS
+            "miss_c", "miss_d", "calib", "auto_ix") + reuse.DIAG_KEYS
+
+
+def _heads(val: str) -> tuple:
+    return tuple(tuple(int(x) for x in lh.split(".")) for lh in val.split(","))
 
 
 def parse_cond(spec: str) -> ReuseConfig:
-    """mode[:value[:max_age]][:masked][:dh=L.H,L.H...][:ix=L.H,...|:ixb=L.H,...], e.g. fresh,
-    timer:16, oracle:0.98:32, estd:0.02:32, timer:16:masked, estd:0.02:32:dh=2.5,25.3 (always-
-    exact KV heads), estp:0.05:32:dh=...:ix=2.5 (stage 3: pre-pass trigger, token-index heads;
-    ixb: the same on the token-pair index; ixu / ixub: the index blocks join the stored set and
-    the trigger stays)."""
+    """mode[:value[:max_age]][:flag][:key=value...]. Positional: the timer period, oracle theta or
+    trigger delta, then max age (quest / static / topk: the byte budget). Flags: masked (refresh
+    applies the fresh set), free (calibration may go negative). Options:
+      dh=L.H,...          always-exact KV heads           ix= / ixb= / ixu= / ixub= token-index heads
+                          (b: token-pair index, u: index union -- the blocks join the stored set)
+      cal=a               stage 4: online calibration of the pre-pass estimate, EMA rate a
+      hold=N              ... applied from step N on      warm=W.A  max age A during the first W steps
+      aix=x               ... heads whose correction exceeds x join the token index
+      kind=logit|add      ... the correction is a log-odds offset (a ratio) or added to the miss share
+      dl=0,1 | dl=none    dense layers (default 0)        p=0.95    top-p level of the stored set
+      match=<condition>   quest / static / topk: budget = that condition's bytes in the same run
+      sub=16              quest: sub-block size of the key min/max
+      union=norm|raw|soft|rr  quest: how a KV head combines its query heads' bounds (ReuseConfig.quest_union)
+      native=1            quest: select and read sub-block pages (Quest's granularity) instead of 64-blocks
+    e.g. timer:16, oracle:0.98:32, estd:0.02:32:dh=2.5,25.3, estp:0.05:32:cal=0.3:warm=32.8,
+    quest:0.4, quest:match=estp_delta0.05_age32_cal0.3."""
     parts = spec.split(":")
-    mode = parts[0]
-    extra = {}
-    while parts[-1].split("=")[0] in ("dh", "ix", "ixb", "ixu", "ixub"):
-        key, val = parts[-1].split("=")
-        heads = tuple(tuple(int(x) for x in lh.split(".")) for lh in val.split(","))
-        extra["dense_heads" if key == "dh" else "index_heads"] = heads
-        if key in ("ixb", "ixub"):
-            extra["index_kind"] = "bigram"
-        if key in ("ixu", "ixub"):
-            extra["index_union"] = True
-        parts = parts[:-1]
+    mode, pos, extra = parts[0], [], {}
+    for part in parts[1:]:
+        if "=" not in part:
+            if part == "masked":
+                extra["refresh"] = "masked"
+            elif part == "free":
+                extra["calib_free"] = True
+            else:
+                pos.append(part)
+            continue
+        key, val = part.split("=", 1)
+        if key == "dh":
+            extra["dense_heads"] = _heads(val)
+        elif key in ("ix", "ixb", "ixu", "ixub"):
+            extra["index_heads"] = _heads(val)
+            if key in ("ixb", "ixub"):
+                extra["index_kind"] = "bigram"
+            if key in ("ixu", "ixub"):
+                extra["index_union"] = True
+        elif key == "cal":
+            extra["calib"] = float(val)
+        elif key == "hold":
+            extra["calib_hold"] = int(val)
+        elif key == "warm":
+            w, a = val.split(".")
+            extra["calib_warm"] = (int(w), int(a))
+        elif key == "aix":
+            extra["calib_auto_ix"] = float(val)
+        elif key == "kind":
+            extra["calib_kind"] = val
+        elif key == "dl":
+            extra["dense_layers"] = () if val in ("", "none") else tuple(int(x) for x in val.split(","))
+        elif key == "p":
+            extra["level"] = float(val)
+        elif key == "match":
+            extra["match"] = val
+        elif key == "sub":
+            extra["quest_sub"] = int(val)
+        elif key == "union":
+            extra["quest_union"] = val
+        elif key == "native":
+            extra["quest_native"] = val in ("1", "true", "yes")
+        else:
+            raise ValueError(f"unknown option {key!r} in {spec!r}")
     if mode == "fresh":
         return ReuseConfig("fresh", **extra)
-    if parts[-1] == "masked":
-        extra["refresh"] = "masked"
-        parts = parts[:-1]
-    if len(parts) > 2:
-        extra["max_age"] = int(parts[2])
+    if mode in reuse.BUDGET_MODES:
+        if pos:
+            extra["budget"] = float(pos[0])
+        assert ("budget" in extra) != ("match" in extra), f"{spec}: give a budget or match=, not both"
+        return ReuseConfig(mode, **extra)
+    if len(pos) > 1:
+        extra["max_age"] = int(pos[1])
     if mode == "timer":
-        return ReuseConfig("timer", N=int(parts[1]), **extra)
+        return ReuseConfig("timer", N=int(pos[0]), **extra)
     if mode == "oracle":
-        return ReuseConfig("oracle", theta=float(parts[1]), **extra)
-    return ReuseConfig(mode, delta=float(parts[1]), **extra)
+        return ReuseConfig("oracle", theta=float(pos[0]), **extra)
+    return ReuseConfig(mode, delta=float(pos[0]), **extra)
+
+
+def meta_frac(cfg: ReuseConfig, D: int, G: int) -> float:
+    """Metadata a sparse layer reads or writes per step, as a share of its K+V bytes (bf16 K and
+    V: 4 D bytes per token and KV head, 256 D per 64-block).
+      refresh (est*): the planner kernels as implemented -- fp32 block key sums (4 D bytes per
+        block), the fp32 references lse_ref / cs_ref and centroid scores (3 G floats read or
+        written), the block stats written by the attention pass and read by `update` (2 x 2 G
+        floats), keep + block list (5 bytes): 2.0% for D = 128, G = 4 (1.2% with bf16 sums);
+      quest: per-channel key min and max per sub-block in bf16 (4 D bytes per sub-block): 1/sub;
+      static / topk / fresh / V-skip / timer: none counted (topk is an oracle)."""
+    if cfg.mode in ("estc", "estd", "estp", "drift", "oracle"):
+        return (4 * D + 4 * 9 * G + 5) / (256 * D)
+    if cfg.mode == "quest":
+        return 1.0 / cfg.quest_sub
+    return 0.0
+
+
+def bytes_of(cfg: ReuseConfig, kept, k_loaded, L: int, D: int, G: int) -> dict:
+    """K+V bytes of a decode run as a share of dense attention's, over all layers and steps."""
+    n_sparse = L - len([l for l in cfg.dense_layers if l < L])
+    blocks = float((k_loaded.mean() + kept.mean()) / 2)
+    meta = meta_frac(cfg, D, G) * n_sparse / L
+    return {"bytes_blocks": blocks, "bytes_meta": meta, "bytes_total": blocks + meta}
+
+
+def set_budget(cfg: ReuseConfig, target: float, L: int, D: int, G: int, steps: int):
+    """quest / static / topk: the share of blocks a sparse layer reads per step so that blocks +
+    metadata over all layers and steps come to `target` of dense attention's bytes (static reads
+    its first step in full, to select)."""
+    dense = len([l for l in cfg.dense_layers if l < L])
+    f = (L * target - dense) / (L - dense) - meta_frac(cfg, D, G)
+    if cfg.mode == "static":
+        f = (steps * f - 1.0) / (steps - 1)
+    cfg.block_frac = max(0.0, f)
+    cfg.budget_target = target
 
 
 GRIDS = {
@@ -115,7 +204,7 @@ def run(model_name, genre, ctx, steps, tok, model, configs, grid_name, with_ref_
     """doc: optional document dict (data/docs format) used instead of data/docs/<genre>.json;
     `genre` then only names the outputs."""
     global IDS
-    eos_ids = list(model.generation_config.eos_token_id)
+    eos_ids = common.eos_ids(model)
     ids, _ = common.build_prompt(tok, doc if doc is not None else common.load_doc(genre), ctx - steps)
     prefix_len = len(ids) - 1
     IDS = torch.zeros(prefix_len + steps, dtype=torch.long, device=model.device)
@@ -149,8 +238,14 @@ def run(model_name, genre, ctx, steps, tok, model, configs, grid_name, with_ref_
     step_rows = [{"condition": "stock_sdpa_bf16", "step": i, "kl": float(noise_kl[i]),
                   "top1_agree": bool(noise_tok[i] == ref_tokens[i])} for i in range(steps)]
     head_frames = []
+    D = getattr(model.config, "head_dim", None) or model.config.hidden_size // model.config.num_attention_heads
+    G = model.config.num_attention_heads // model.config.num_key_value_heads
+    spent = {}                                   # condition name -> bytes (for match=)
 
     for cfg in configs:
+        if cfg.mode in reuse.BUDGET_MODES:
+            target = cfg.budget if cfg.match is None else spent[cfg.match]["bytes_total"]
+            set_budget(cfg, target, L, D, G, steps)
         name = cfg.name()
         t0 = time.perf_counter()
         lp, toks, recs = decode(model, cache, prefix_len, first, steps, eos_ids, ref_tokens, cfg)
@@ -161,8 +256,12 @@ def run(model_name, genre, ctx, steps, tok, model, configs, grid_name, with_ref_
         k_loaded = np.ones_like(kept) if cfg.mode in ("fresh",) + reuse.VSKIP_MODES else kept  # K read in full
         sparse_layers = [l for l in range(L) if l not in cfg.dense_layers]
         refresh_rate = float(R["refresh"][1:, sparse_layers].mean())        # step 0 always refreshes
+        spent[name] = bytes_of(cfg, kept, k_loaded, L, D, G)
         row = {"condition": name, "mode": cfg.mode, "N": cfg.N, "theta": cfg.theta, "delta": cfg.delta,
-               "max_age": cfg.max_age, "refresh": cfg.refresh,
+               "max_age": cfg.max_age, "refresh": cfg.refresh, **spent[name],
+               "block_frac": cfg.block_frac, "budget_target": cfg.budget_target, "match": cfg.match,
+               "calib_final_mean": float(R["calib"][-1, sparse_layers].mean()),
+               "calib_heads_gt1": int((R["calib"][-1, sparse_layers] > 1.0).sum()),
                "kl_mean": float(k.mean()), "kl_median": float(np.median(k)),
                "kl_p95": float(np.quantile(k, 0.95)), "kl_max": float(k.max()),
                "kl_x_noise": float(k.mean() / noise_kl.mean()),
@@ -192,7 +291,8 @@ def run(model_name, genre, ctx, steps, tok, model, configs, grid_name, with_ref_
             **{key: R[key].reshape(-1).astype(np.float32) for key in REC_KEYS}}))
         print(f"  {name:24s} KL={row['kl_mean']:.2e} (x{row['kl_x_noise']:.2f}) p95={row['kl_p95']:.2e} "
               f"top1={row['top1_agree']:.3f} K-skip={row['k_skip']:.3f} V-skip={row['v_skip']:.3f} "
-              f"refresh={refresh_rate:.3f} cov_min p01={row['covered_min_p01']:.3f} {row['seconds']}s", flush=True)
+              f"bytes={row['bytes_total']:.3f} refresh={refresh_rate:.3f} "
+              f"cov_min p01={row['covered_min_p01']:.3f} {row['seconds']}s", flush=True)
 
     sfx = "" if grid_name == "main" else f".{grid_name}"
     meta = {"model": model_name, "genre": genre, "ctx": ctx}
@@ -211,7 +311,8 @@ def main():
     ap.add_argument("--steps", type=int, default=128)
     ap.add_argument("--grid", default="main", help="output suffix; 'main' and 'diag' have default conditions")
     ap.add_argument("--cond", nargs="*", default=[], help="conditions, see parse_cond (overrides the grid's)")
-    ap.add_argument("--doc", nargs="*", default=[], help="extra documents: data/docs/a4/<name>.json (named by <name>)")
+    ap.add_argument("--doc", nargs="*", default=[],
+                    help="other documents by name: data/docs/{a4,s3}/<name>.json (instead of --genre)")
     args = ap.parse_args()
     tok, model = common.load(args.model)
     STATE.vocab = vocab_classes(tok, model.device, model.config.vocab_size)
@@ -219,9 +320,8 @@ def main():
     for ctx in args.ctx:
         if args.doc:
             for name in args.doc:
-                doc = json.loads((common.ROOT / "data" / "docs" / "a4" / f"{name}.json").read_text())
                 run(args.model, name, ctx, args.steps, tok, model, configs, args.grid,
-                    with_ref_stats=False, doc=doc)
+                    with_ref_stats=False, doc=common.load_named_doc(name))
             continue
         for genre in args.genre:
             run(args.model, genre, ctx, args.steps, tok, model, configs, args.grid,

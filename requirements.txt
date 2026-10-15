@@ -1,0 +1,24 @@
+# Pinned environment of all stages (Python 3.11, CUDA 12.6 wheels, nvcc 12.5 for the extension).
+#   uv venv .venv --python 3.11
+#   uv pip install --python .venv/bin/python -r requirements.txt --index-strategy unsafe-best-match \
+#       --extra-index-url https://download.pytorch.org/whl/cu126
+# flash-attn (baseline and the lab's prefill only) has no wheel for torch 2.14: see README, "Setup".
+torch==2.14.1+cu126
+triton==3.8.0
+transformers==5.19.0
+tokenizers==0.23.3
+safetensors==0.8.0
+huggingface_hub==2.2.0
+accelerate==1.15.0
+numpy==2.4.6
+pandas==3.0.6
+pyarrow==26.0.0
+scipy==1.17.1
+matplotlib==3.11.2
+tabulate==0.10.0
+jinja2==3.1.6
+ninja==1.13.2
+# flash-attn source build
+einops==0.8.2
+packaging==26.3
+psutil==7.2.2

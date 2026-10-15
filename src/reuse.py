@@ -36,6 +36,26 @@ diagnostics: block mass covered by that index set (min over the G heads), the
 token-level mass on its positions, and the mass on token classes (same token as the
 current one, right after one, special tokens, newline tokens, sink block, local blocks).
 
+Online calibration (stage 4, `calib` = its rate): on a refresh step a head reads every
+block, so it learns the mass its stale set really missed, next to the pre-pass estimate it
+decided with. Each KV head keeps a correction c and decides on the corrected estimate:
+  logit  c = EMA of logit(real miss) - logit(estimated miss), decision sigmoid(logit(est) + c)
+  add    c = EMA of real - estimated, decision est + c
+  peak   c = max((1 - calib) c, real - estimated): a decaying maximum, so a single large
+         invisible miss keeps the head sensitive for ~1/calib samples; decision est + c
+(real and estimated misses are the max over the G query heads). By default c >= 0: the
+correction can only raise an estimate. `calib_hold` delays applying it,
+`calib_warm` = (W, A) refreshes every head at least every A steps during the first W steps
+(more samples while c is cold), and `calib_auto_ix` latches a head onto the token index
+(index union) once c exceeds that threshold.
+
+Baselines at a byte budget (stage 4): "quest" reads, on every step, the blocks with the
+highest Quest bound (per-channel key min/max of `quest_sub`-token sub-blocks, loaded by 64;
+query heads ranked on their own normalised bound, max over the group) up to `budget` of the
+blocks; "static" keeps the top `budget` blocks of the first decode step's exact attention
+(GQA union of per-head ranks) and never updates them (SnapKV/H2O-like). Both always read
+the sink block and the `local` newest blocks, inside the budget.
+
 Every step and layer records per KV head: mass covered by the blocks actually
 used (min / mean over the G heads), the mass the stale set would have covered,
 fraction of blocks used, refresh flag, query drift and age of the set.
@@ -71,12 +91,36 @@ class ReuseConfig:
     index_kind: str = "token"         # token | bigram: the index the index heads use
     index_union: bool = False         # index heads attend stored set + index blocks and keep the trigger
     diag: bool = True                 # compute the miss estimates even when the policy does not use them
+    calib: float | None = None        # stage 4: rate of the per-KV-head estimate correction (EMA rate / peak decay)
+    calib_hold: int = 0               # steps before the correction is applied (it is learned from step 1)
+    calib_warm: tuple = ()            # (W, A): max age A instead of max_age during the first W steps
+    calib_free: bool = False          # allow negative corrections (default: c >= 0)
+    calib_auto_ix: float | None = None  # log-odds threshold: a head above it joins the token index (latched)
+    calib_kind: str = "logit"         # logit: c corrects log-odds (a ratio); add: c is added to the miss share;
+                                      # peak: added too, but c = max((1 - calib) c, residual) holds the worst one
+    budget: float | None = None       # quest / static / topk: K+V bytes (blocks + metadata) vs dense, all layers
+    match: str | None = None          # quest / static / topk: budget = the bytes of this condition (same run)
+    quest_sub: int = 16               # quest: sub-block size of the key min/max
+    quest_union: str = "norm"         # quest, GQA: norm = max over the group of each head's bound minus its best
+                                      # block's; raw = max of the raw bounds; soft = sum over the group of
+                                      # softmax(bound); rr = round robin over the heads' rankings
+    quest_native: bool = False        # quest: select and read quest_sub-token pages (Quest's own granularity)
+    block_frac: float | None = None   # set by the runner from the budget: blocks read per sparse layer and step
+    budget_target: float | None = None
 
     def name(self) -> str:
         if self.mode == "fresh":
             return "fresh"
         if self.mode in VSKIP_MODES:
             return f"{self.mode}_tau{self.delta:g}"
+        if self.mode in BUDGET_MODES:
+            tag = self.mode + (f"{self.quest_sub}" if self.mode == "quest" else "")
+            if self.mode == "quest" and self.quest_union != "norm":
+                tag += self.quest_union
+            if self.mode == "quest" and self.quest_native:
+                tag += "native"
+            tag += f"_match-{self.match}" if self.match else f"_b{self.budget:g}"
+            return tag + ("" if self.dense_layers == (0,) else "_dl" + "".join(map(str, self.dense_layers)))
         if self.mode == "timer":
             tag = f"timer_N{self.N}"
         elif self.mode == "oracle":
@@ -92,10 +136,143 @@ class ReuseConfig:
         if self.index_heads:
             tag += (f"_ix{'u' if self.index_union else ''}{len(self.index_heads)}"
                     + ("b" if self.index_kind == "bigram" else ""))
+        if self.calib is not None:
+            tag += f"_cal{self.calib:g}"
+            if self.calib_hold:
+                tag += f"h{self.calib_hold}"
+            if self.calib_warm:
+                tag += f"w{self.calib_warm[0]}a{self.calib_warm[1]}"
+            if self.calib_free:
+                tag += "free"
+            if self.calib_kind != "logit":
+                tag += self.calib_kind
+            if self.calib_auto_ix is not None:
+                tag += f"_aix{self.calib_auto_ix:g}"
+        if self.level != 0.99:
+            tag += f"_p{self.level:g}"
+        if self.dense_layers != (0,):
+            tag += "_dl" + ("".join(map(str, self.dense_layers)) or "none")
         return tag
 
 
 VSKIP_MODES = ("vtau", "vsink", "vprev", "vprev2")
+BUDGET_MODES = ("quest", "static", "topk")     # stage 4 baselines at a byte budget (topk: per-step oracle)
+
+
+def top_blocks(score: torch.Tensor, frac: float, always_row: torch.Tensor) -> torch.Tensor:
+    """The round(frac * nb) highest-scoring blocks per row of score [Hkv, nb], the sink and
+    local blocks always among them -> bool [Hkv, nb]."""
+    nb = score.shape[-1]
+    n = min(nb, max(int(always_row.sum()), round(frac * nb)))
+    top = score.masked_fill(always_row[None, :], float("inf")).topk(n, dim=-1).indices
+    return torch.zeros_like(score, dtype=torch.bool).scatter(-1, top, True)
+
+
+def union_scores(ub: torch.Tensor, how: str) -> torch.Tensor:
+    """Per-query-head bounds [Hkv, G, n] -> one score per KV head [Hkv, n] (see ReuseConfig.quest_union)."""
+    if how == "norm":
+        return (ub - ub.amax(-1, keepdim=True)).amax(1)
+    if how == "raw":
+        return ub.amax(1)
+    if how == "soft":
+        return torch.softmax(ub, dim=-1).sum(1)
+    if how == "rr":                                   # round robin: a block's best rank over the group
+        rank = ub.argsort(-1, descending=True).argsort(-1).float()          # 0 = best, per head
+        G = ub.shape[1]
+        key = rank * G + torch.arange(G, device=ub.device, dtype=torch.float32)[None, :, None]
+        return -key.amin(1)
+    raise ValueError(how)
+
+
+def quest_bounds(q, k, scaling: float, sub: int) -> torch.Tensor:
+    """Quest bound of every `sub`-token sub-block per query head: sum_d max(q_d min_d, q_d max_d)
+    (per-channel key min / max) -> [Hkv, G, nsub], -inf past the end."""
+    T = k.shape[1]
+    kt = k.transpose(1, 2)                                                   # [Hkv, D, T]
+    kmax = blocks_of(kt, sub, float("-inf")).amax(-1).transpose(1, 2)       # [Hkv, nsub, D]
+    kmin = blocks_of(kt, sub, float("inf")).amin(-1).transpose(1, 2)
+    nsub = kmax.shape[1]
+    valid = torch.arange(nsub, device=k.device) * sub < T
+    kmax, kmin = kmax.masked_fill(~valid[None, :, None], 0.0), kmin.masked_fill(~valid[None, :, None], 0.0)
+    qe = q.unsqueeze(2)
+    ub = torch.maximum(qe * kmin[:, None], qe * kmax[:, None]).sum(-1) * scaling
+    return ub.masked_fill(~valid, float("-inf"))
+
+
+def quest_scores(q, k, scaling: float, sub: int, how: str = "norm") -> torch.Tensor:
+    """Quest bound of each 64-block: the max over its sub-blocks of sum_d max(q_d min_d, q_d max_d)
+    (per-channel key min/max of `sub`-token sub-blocks), combined over the G heads of a KV head
+    by `how` (default: each head's bound minus its best block's, max over the group) -> [Hkv, nb]."""
+    if how != "norm":
+        ub = blocks_of(quest_bounds(q, k, scaling, sub), BLOCK // sub, float("-inf")).amax(-1)
+        return union_scores(ub, how)
+    T = k.shape[1]
+    kt = k.transpose(1, 2)                                                   # [Hkv, D, T]
+    kmax = blocks_of(kt, sub, float("-inf")).amax(-1).transpose(1, 2)       # [Hkv, nsub, D]
+    kmin = blocks_of(kt, sub, float("inf")).amin(-1).transpose(1, 2)
+    nsub = kmax.shape[1]
+    valid = torch.arange(nsub, device=k.device) * sub < T                    # sub-blocks holding a token
+    kmax, kmin = kmax.masked_fill(~valid[None, :, None], 0.0), kmin.masked_fill(~valid[None, :, None], 0.0)
+    qe = q.unsqueeze(2)                                                      # [Hkv, G, 1, D]
+    ub = torch.maximum(qe * kmin[:, None], qe * kmax[:, None]).sum(-1) * scaling   # [Hkv, G, nsub]
+    ub = ub.masked_fill(~valid, float("-inf"))
+    ub = blocks_of(ub, BLOCK // sub, float("-inf")).amax(-1)                 # [Hkv, G, nb]
+    return (ub - ub.amax(-1, keepdim=True)).amax(1)
+
+
+def quest_native(cfg, records, s, p, q, k, scaling: float, layer: int, always_row, first: bool):
+    """Quest at its own granularity: the top block_frac of the quest_sub-token pages by bound (sink
+    and local 64-blocks always in), read token-exactly; `kept` is the share of pages read."""
+    Hkv, G, T = s.shape
+    dev = s.device
+    sub = cfg.quest_sub
+    score = union_scores(quest_bounds(q, k, scaling, sub), cfg.quest_union)          # [Hkv, nsub]
+    nsub = score.shape[-1]
+    always_sub = always_row.repeat_interleave(BLOCK // sub)[:nsub]
+    sel = top_blocks(score, cfg.block_frac, always_sub)                               # [Hkv, nsub]
+    tok = sel.repeat_interleave(sub, dim=-1)[:, :T]                                   # [Hkv, T]
+    covered = (p * tok[:, None, :]).sum(-1)                                           # [Hkv, G]
+    zeros = torch.zeros(Hkv, device=dev)
+    records[layer] = dict(covered_min=covered.amin(-1), covered_mean=covered.mean(-1),
+                          covered_stale_min=covered.amin(-1), kept=sel.float().mean(-1),
+                          refresh=torch.full((Hkv,), first, dtype=torch.bool, device=dev),
+                          drift=zeros, age=zeros, miss_c=zeros, miss_d=zeros, calib=zeros, auto_ix=zeros)
+    if bool(tok.all()):
+        return p
+    return torch.softmax(s.masked_fill(~tok[:, None, :], float("-inf")), dim=-1)
+
+
+def budgeted(cfg, states, records, s, p, q, k, scaling: float, layer: int, always_row):
+    """quest / static / topk at a fixed share cfg.block_frac of the blocks per KV head and step."""
+    Hkv, G, T = s.shape
+    dev = s.device
+    W = metrics.block_weights(p)                                             # [Hkv, G, nb]
+    zeros = torch.zeros(Hkv, device=dev)
+    first = layer not in states
+    states.setdefault(layer, {})
+    if cfg.mode == "quest" and cfg.quest_native:          # Quest's own pages: select and read sub-blocks
+        return quest_native(cfg, records, s, p, q, k, scaling, layer, always_row, first)
+    if cfg.mode == "quest":
+        sel = top_blocks(quest_scores(q, k, scaling, cfg.quest_sub, cfg.quest_union), cfg.block_frac, always_row)
+    elif cfg.mode == "topk":                                                 # oracle: this step's exact weights
+        sel = top_blocks(W.amax(1), cfg.block_frac, always_row)
+    elif first:                                                              # static: the first step's weights
+        sel = top_blocks(W.amax(1), cfg.block_frac, always_row)
+        states[layer]["sel"] = sel
+    else:
+        stored = states[layer]["sel"]
+        sel = F.pad(stored, (0, W.shape[-1] - stored.shape[-1]), value=False) | always_row[None, :]
+    if cfg.mode == "static" and first:
+        sel = torch.ones_like(sel)                                           # the first step itself is exact
+    covered = (W * sel[:, None, :]).sum(-1)                                  # [Hkv, G]
+    refresh = torch.full((Hkv,), first, dtype=torch.bool, device=dev)
+    records[layer] = dict(covered_min=covered.amin(-1), covered_mean=covered.mean(-1),
+                          covered_stale_min=covered.amin(-1), kept=sel.float().mean(-1), refresh=refresh,
+                          drift=zeros, age=zeros, miss_c=zeros, miss_d=zeros, calib=zeros, auto_ix=zeros)
+    if bool(sel.all()):
+        return p
+    drop = (~sel).repeat_interleave(BLOCK, dim=-1)[:, :T]
+    return torch.softmax(s.masked_fill(drop[:, None, :], float("-inf")), dim=-1)
 
 
 def vskip(cfg: ReuseConfig, states: dict, records: dict, s, p, layer: int):
@@ -168,6 +345,32 @@ def est_miss(est_lse, attended_lse, unsel):
     return torch.sigmoid(out - attended_lse).amax(-1)
 
 
+CALIB_EPS = 1e-6                      # miss shares are clamped to [eps, 1 - eps] before the logit
+
+
+def logit(x: torch.Tensor) -> torch.Tensor:
+    x = x.clamp(CALIB_EPS, 1.0 - CALIB_EPS)
+    return torch.log(x) - torch.log1p(-x)
+
+
+def calib_update(cfg, calib, refresh, real, est):
+    """EMA of logit(real) - logit(est) (kind "add": of real - est) on the heads that refresh
+    (they read every block, so they know the real miss of their stale set); c >= 0 unless
+    cfg.calib_free."""
+    resid = logit(real) - logit(est) if cfg.calib_kind == "logit" else real - est
+    if cfg.calib_kind == "peak":                                   # a decaying maximum: the tail, not the mean
+        new = torch.maximum((1.0 - cfg.calib) * calib, resid)
+    else:
+        new = (1.0 - cfg.calib) * calib + cfg.calib * resid
+    if not cfg.calib_free:
+        new = new.clamp_min(0.0)
+    return torch.where(refresh, new, calib)
+
+
+def calib_apply(cfg, est, calib):
+    return torch.sigmoid(logit(est) + calib) if cfg.calib_kind == "logit" else est + calib   # add, peak
+
+
 DIAG_KEYS = ("miss_p", "idx_cov", "idx_tok", "idx_kept", "idx2_cov", "idx2_tok", "idx2_kept", "m_same", "m_after",
              "m_special", "m_newline", "m_sink", "m_local")
 
@@ -237,10 +440,15 @@ def apply(cfg: ReuseConfig, states: dict, records: dict, s, p, q, layer: int, st
     if layer in cfg.dense_layers:
         records[layer] = dict(covered_min=ones, covered_mean=ones, covered_stale_min=ones, kept=ones,
                               refresh=torch.ones(Hkv, dtype=torch.bool, device=dev),
-                              drift=zeros, age=zeros, miss_c=zeros, miss_d=zeros, **diag)
+                              drift=zeros, age=zeros, miss_c=zeros, miss_d=zeros, calib=zeros, auto_ix=zeros,
+                              **diag)
         return p
     if cfg.mode in VSKIP_MODES:
         out = vskip(cfg, states, records, s, p, layer)
+        records[layer].update(diag, calib=zeros, auto_ix=zeros)
+        return out
+    if cfg.mode in BUDGET_MODES:
+        out = budgeted(cfg, states, records, s, p, q, k, scaling, layer, always_row)
         records[layer].update(diag)
         return out
 
@@ -261,6 +469,12 @@ def apply(cfg: ReuseConfig, states: dict, records: dict, s, p, q, layer: int, st
         cs = lse_now = torch.zeros(Hkv, G, nb, device=dev)
 
     st = states.get(layer)
+    no_heads = torch.zeros(Hkv, dtype=torch.bool, device=dev)
+    calib = zeros if st is None else st["calib"]                   # [Hkv] log-odds correction (stage 4)
+    auto_ix = no_heads if st is None else st["auto_ix"]            # [Hkv] latched onto the token index
+    if cfg.calib_auto_ix is not None:
+        assert idx is not None, "calib_auto_ix needs token ids"
+        extra = extra | (auto_ix[:, None] & idx[None, :])
     if st is None:
         refresh = torch.ones(Hkv, dtype=torch.bool, device=dev)
         stored = fresh
@@ -291,6 +505,10 @@ def apply(cfg: ReuseConfig, states: dict, records: dict, s, p, q, layer: int, st
         else:
             miss_c = miss_d = miss_p = zeros
         lse_ref, cs_ref = st["lse_ref"], st["cs_ref"]
+        miss_dec = miss_p
+        if cfg.calib is not None and step >= cfg.calib_hold:
+            assert cfg.mode == "estp", "the calibration corrects the pre-pass estimate"
+            miss_dec = calib_apply(cfg, miss_p, calib)
         if cfg.mode == "fresh":
             refresh = torch.ones(Hkv, dtype=torch.bool, device=dev)
         elif cfg.mode == "timer":
@@ -304,11 +522,14 @@ def apply(cfg: ReuseConfig, states: dict, records: dict, s, p, q, layer: int, st
         elif cfg.mode == "estd":
             refresh = miss_d > cfg.delta
         elif cfg.mode == "estp":
-            refresh = miss_p > cfg.delta
+            refresh = miss_dec > cfg.delta
         else:
             raise ValueError(cfg.mode)
         if cfg.max_age:
-            refresh = refresh | (age >= cfg.max_age)
+            age_lim = cfg.max_age
+            if cfg.calib_warm and step < cfg.calib_warm[0]:
+                age_lim = min(age_lim, cfg.calib_warm[1])
+            refresh = refresh | (age >= age_lim)
         forced = [h for (l, h) in cfg.dense_heads if l == layer]
         if forced:
             refresh = refresh.clone()
@@ -331,14 +552,20 @@ def apply(cfg: ReuseConfig, states: dict, records: dict, s, p, q, layer: int, st
         cs_ref = F.pad(cs_ref, (0, nb - cs_ref.shape[-1]), value=0.0)
     sel_next = torch.where(refresh[:, None], fresh, stored)
     lse_att = lse_now.masked_fill(~(sel_next | always)[:, None, :], float("-inf")).logsumexp(-1)   # [Hkv, G]
+    if cfg.calib is not None and st is not None:                  # learn from this step's refreshes
+        calib = calib_update(cfg, calib, refresh, 1.0 - covered_stale, miss_p)
+        if cfg.calib_auto_ix is not None:
+            auto_ix = auto_ix | (calib > cfg.calib_auto_ix)
     states[layer] = dict(sel=sel_next, age=torch.where(refresh, torch.zeros_like(age), age),
                          qn_ref=torch.where(r3, qn, qn_ref), lse_att=lse_att,
-                         lse_ref=torch.where(r3, lse_now, lse_ref), cs_ref=torch.where(r3, cs, cs_ref))
+                         lse_ref=torch.where(r3, lse_now, lse_ref), cs_ref=torch.where(r3, cs, cs_ref),
+                         calib=calib, auto_ix=auto_ix)
     covered = (W * sel_now[:, None, :]).sum(-1)                   # [Hkv, G]
     diag["miss_p"] = miss_p
     records[layer] = dict(covered_min=covered.amin(-1), covered_mean=covered.mean(-1),
                           covered_stale_min=covered_stale, kept=sel_now.float().mean(-1),
-                          refresh=refresh, drift=drift, age=age.float(), miss_c=miss_c, miss_d=miss_d, **diag)
+                          refresh=refresh, drift=drift, age=age.float(), miss_c=miss_c, miss_d=miss_d,
+                          calib=calib, auto_ix=auto_ix.float(), **diag)
     if bool(sel_now.all()):
         return p
     drop = (~sel_now).repeat_interleave(BLOCK, dim=-1)[:, :T]     # [Hkv, T]

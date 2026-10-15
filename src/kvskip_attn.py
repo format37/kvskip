@@ -28,12 +28,23 @@ Prefill (q_len > 1) goes to SDPA. Decode (q_len == 1) is selected by KVSKIP.mode
              without its planner, i.e. what fusing the planner into kernels can reach.
 Layers in KVSKIP.dense_layers always use the dense kernel.
 
+Online calibration (stage 4, KVSKIP.calib = its rate; refresh_pre and refresh_fused): a
+refreshing KV head reads every block, so the pass's block stats give the mass its attended
+set really missed; the head keeps a correction c of its estimate (both the max over its
+G query heads): an EMA of real - estimate (calib_kind "add") or of logit(real) -
+logit(estimate) ("logit"), or the decaying maximum max((1 - calib) c, real - estimate)
+("peak", the stage-4 policy), and decides on estimate + c (or sigmoid(logit(estimate) + c))
+> delta from step calib_hold on; c >= 0 unless calib_free. During the first calib_warm[0]
+steps the max age is calib_warm[1]. With calib_auto_ix, a head whose c exceeds it is latched
+onto the token index (index union; the driver sets idx_blocks every step). Same semantics as
+the probe's ReuseConfig(calib=...) (src/reuse.py).
+
 GrowingCache() is a preallocated KV cache whose layers return views into a
 buffer grown by doubling, so decode does not pay HF DynamicCache's per-step
 torch.cat of the whole cache (needed for honest end-to-end timing).
 
-The planner is plain PyTorch on the GPU (several small launches per layer and
-step); a production version would fuse it into the kernels.
+The planner of "refresh" / "refresh_pre" is plain PyTorch on the GPU (~80 small launches
+per layer and step); "refresh_fused" runs the same policy in two CUDA kernels.
 """
 
 import math
@@ -115,6 +126,13 @@ class KvskipConfig:
     index_heads: tuple = ()       # (layer, kv_head) pairs on the token index (refresh_pre / refresh_fused)
     index_union: bool = False     # index blocks join the head's attended set (trigger stays) instead of replacing it
     idx_blocks: object = None     # this step's token-index blocks [B, >= nb] bool, set by the driver
+    calib: float | None = None    # stage 4: rate of the online estimate correction (EMA rate / peak decay; None: off)
+    calib_hold: int = 0           # decode steps before the correction is applied
+    calib_warm: tuple = ()        # (W, A): max age A during the first W decode steps
+    calib_free: bool = False      # allow negative corrections
+    calib_kind: str = "logit"     # "logit": log-odds offset; "add": added to the miss share;
+                                  # "peak": added, c = max((1 - calib) c, residual)
+    calib_auto_ix: float | None = None   # heads whose correction exceeds this join the token index
     count: bool = True            # keep the per-layer byte counters (GPU tensors, no host sync)
     record: bool = False          # refresh_pre: append each step's block mask to plans[layer]
     state: dict = field(default_factory=dict)       # per-layer planner state (refresh mode)
@@ -266,6 +284,47 @@ def _attended_lse(logw, keep, G):
     return logw.masked_fill(~keep.repeat_interleave(G, dim=1), float("-inf")).logsumexp(-1)
 
 
+CALIB_EPS = 1e-6
+
+
+def _logit(x):
+    x = x.clamp(CALIB_EPS, 1.0 - CALIB_EPS)
+    return torch.log(x) - torch.log1p(-x)
+
+
+def _max_age(st) -> int:
+    """The max age at this layer's current decode step (shorter during the calibration warm-up)."""
+    if KVSKIP.calib_warm and st["t"] < KVSKIP.calib_warm[0]:
+        return min(KVSKIP.max_age, KVSKIP.calib_warm[1])
+    return KVSKIP.max_age
+
+
+def _calib_learn(st, logw, sel, trig, est, G):
+    """Calibration update on the refreshing heads: logw [B, Hq, nb] holds every block for them,
+    sel [B, Hkv, nb] is the set they would have attended, est [B, Hkv] the pre-pass estimate."""
+    B, Hkv = trig.shape
+    hsel = sel.repeat_interleave(G, dim=1)
+    lin = logw.masked_fill(~hsel, float("-inf")).logsumexp(-1)
+    lout = logw.masked_fill(hsel, float("-inf")).logsumexp(-1)
+    real = torch.sigmoid(lout - lin).view(B, Hkv, G).amax(-1)
+    resid = _logit(real) - _logit(est) if KVSKIP.calib_kind == "logit" else real - est
+    if KVSKIP.calib_kind == "peak":                                    # decaying maximum of the residual
+        new = torch.maximum((1.0 - KVSKIP.calib) * st["calib"], resid)
+    else:
+        new = (1.0 - KVSKIP.calib) * st["calib"] + KVSKIP.calib * resid
+    if not KVSKIP.calib_free:
+        new = new.clamp_min(0.0)
+    st["calib"] = torch.where(trig, new, st["calib"])
+    if KVSKIP.calib_auto_ix is not None:
+        st["aix"] |= st["calib"] > KVSKIP.calib_auto_ix
+
+
+def _calib_apply(st, miss):
+    if KVSKIP.calib_kind in ("add", "peak"):
+        return miss + st["calib"]
+    return torch.sigmoid(_logit(miss) + st["calib"])
+
+
 def refresh_pre_step(layer, q, k, v, scale):
     """refresh_step with the trigger decided before the pass: one masked kernel with block
     stats per step, no host sync. The attended mass in the estimate's denominator is the
@@ -284,6 +343,9 @@ def refresh_pre_step(layer, q, k, v, scale):
         logw = r["blk_max"] + torch.log(r["blk_sum"])
         _refresh_state(st, q32, logw, r["blk_max"], st["csum"], T, G)
         st["lse_att"] = _attended_lse(logw, st["keep"] | always, G)
+        st["t"] = 0
+        st["calib"] = torch.zeros(B, Hkv, dtype=torch.float32, device=q.device)
+        st["aix"] = torch.zeros(B, Hkv, dtype=torch.bool, device=q.device)
         if KVSKIP.record:
             KVSKIP.plans.setdefault(layer, []).append(torch.ones(B, Hkv, nb, dtype=torch.bool, device=q.device))
         _count(layer, "dense_heads", B * Hkv)
@@ -297,6 +359,8 @@ def refresh_pre_step(layer, q, k, v, scale):
     ix = [h for (l, h) in KVSKIP.index_heads if l == layer]
     if ix and KVSKIP.index_union:
         sel[:, ix] |= KVSKIP.idx_blocks[:, None, :nb]
+    if KVSKIP.calib_auto_ix is not None:                               # heads latched onto the index
+        sel |= st["aix"][..., None] & KVSKIP.idx_blocks[:, None, :nb]
     nbr = st["lse_ref"].shape[-1]
     cs = _centroid_scores(q32, csum, T, scale)                         # [B, Hq, nb]
     est = _pad_blocks(st["lse_ref"] + cs[..., :nbr] - st["cs_ref"][..., :nbr], nb, float("-inf"))
@@ -304,8 +368,12 @@ def refresh_pre_step(layer, q, k, v, scale):
     unsel[..., nbr:] = False
     est = est.masked_fill(~unsel.repeat_interleave(G, dim=1), float("-inf"))
     miss = torch.sigmoid(est.logsumexp(-1) - st["lse_att"]).view(B, Hkv, G).amax(-1)   # [B, Hkv]
+    st["t"] += 1
+    miss_dec = miss
+    if KVSKIP.calib is not None and st["t"] >= KVSKIP.calib_hold:
+        miss_dec = _calib_apply(st, miss)
     st["age"] += 1
-    trig = (miss > KVSKIP.delta) | (st["age"] >= KVSKIP.max_age)
+    trig = (miss_dec > KVSKIP.delta) | (st["age"] >= _max_age(st))
     forced = [h for (l, h) in KVSKIP.dense_heads if l == layer]
     if forced:
         trig[:, forced] = True
@@ -317,6 +385,8 @@ def refresh_pre_step(layer, q, k, v, scale):
         KVSKIP.plans.setdefault(layer, []).append(read)
     r = K.decode(q, k, v, scale, plan=K.make_plan(read, sync=False), stats=True)
     logw = r["blk_max"] + torch.log(r["blk_sum"])                      # -inf on blocks not read
+    if KVSKIP.calib is not None:
+        _calib_learn(st, logw, sel, trig, miss, G)
     _refresh_state(st, q32, logw, r["blk_max"], csum, T, G, heads=trig)
     st["lse_att"] = _attended_lse(logw, _pad_blocks(st["keep"], nb, False) | always, G)
     _count(layer, "blocks_read", read.sum())
@@ -354,6 +424,8 @@ def _pack_fused(st, layer, q, nb):
         cs_ref=padded(_pad_blocks(st["cs_ref"], nb, 0.0), 0.0, torch.float32),
         csum=padded(st["csum"], 0.0, torch.float32),
         lse_att=st["lse_att"].float().contiguous(), age=st["age"].to(torch.int32).contiguous(),
+        calib=st["calib"].float().contiguous(), est=torch.zeros(B, Hkv, dtype=torch.float32, device=dev),
+        aix=st["aix"].to(torch.uint8).contiguous(),
         cs_now=torch.zeros(B, Hq, NBC, dtype=torch.float32, device=dev),
         trig=torch.zeros(B, Hkv, dtype=torch.uint8, device=dev),
         block_idx=torch.zeros(B, Hkv, NBC, dtype=torch.int32, device=dev),
@@ -383,15 +455,22 @@ def refresh_fused_step(layer, q, k, v, scale):
         _grow_fused(f, nb + FUSED_MARGIN)
     ext = K.ext()
     idx = None
-    if any(l == layer for (l, _) in KVSKIP.index_heads):
+    if any(l == layer for (l, _) in KVSKIP.index_heads) or KVSKIP.calib_auto_ix is not None:
         idx = torch.zeros(B, f["NBC"], dtype=torch.uint8, device=q.device)
         idx[:, :nb] = KVSKIP.idx_blocks[:, :nb]
+    st["t"] += 1
+    cal = KVSKIP.calib is not None
     ext.plan(q, k, f["csum"], f["lse_ref"], f["cs_ref"], f["keep"], f["lse_att"], f["age"], f["flags"],
              f["cs_now"], f["trig"], f["block_idx"], f["block_cnt"], float(scale), float(KVSKIP.delta),
-             int(KVSKIP.max_age), int(KVSKIP.local), True, idx)
+             int(_max_age(st)), int(KVSKIP.local), True, idx, f["calib"] if cal else None, f["est"],
+             cal and st["t"] >= KVSKIP.calib_hold, {"logit": 0, "add": 1, "peak": 2}[KVSKIP.calib_kind],
+             f["aix"] if KVSKIP.calib_auto_ix is not None else None)
     r = K.decode(q, k, v, scale, plan=K.Plan(f["block_idx"], f["block_cnt"], nb, nb), stats=True)
     ext.update(r["blk_max"], r["blk_sum"], f["trig"], f["cs_now"], f["keep"], f["lse_ref"], f["cs_ref"],
-               f["lse_att"], T, float(KVSKIP.level), int(KVSKIP.local))
+               f["lse_att"], T, float(KVSKIP.level), int(KVSKIP.local), f["flags"], idx, f["est"],
+               f["calib"] if cal else None, float(KVSKIP.calib or 0.0), bool(KVSKIP.calib_free),
+               {"logit": 0, "add": 1, "peak": 2}[KVSKIP.calib_kind], f["aix"] if KVSKIP.calib_auto_ix is not None else None,
+               float(KVSKIP.calib_auto_ix or 0.0))
     _count(layer, "blocks_read", f["block_cnt"].sum())
     _count(layer, "blocks_total", B * Hkv * nb)
     _count(layer, "masked_heads", B * Hkv)

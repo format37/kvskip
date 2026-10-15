@@ -1,6 +1,6 @@
 # kvskip — дайджест этапа 2: какое ядро и пол под него
 
-*12–13 окт 2026 · Llama-3.1-8B-Instruct (bf16) · RTX 4090 · kickoff: `docs/02-core.md`*
+*12–13 окт 2026 · Llama-3.1-8B-Instruct (bf16) · RTX 4090 · kickoff: `docs/02-kernel.md`*
 
 ## TL;DR
 

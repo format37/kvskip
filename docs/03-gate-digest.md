@@ -1,6 +1,6 @@
 # kvskip — дайджест этапа 3: есть ли выигрыш там, где он должен быть
 
-*13 окт 2026 · Llama-3.1-8B-Instruct (bf16), Qwen3-8B · RTX 4090 · kickoff: `docs/03-win.md`*
+*13 окт 2026 · Llama-3.1-8B-Instruct (bf16), Qwen3-8B · RTX 4090 · kickoff: `docs/03-gate.md`*
 
 ## TL;DR
 
