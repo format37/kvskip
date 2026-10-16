@@ -52,8 +52,11 @@ def parse_cond(spec: str) -> ReuseConfig:
       sub=16              quest: sub-block size of the key min/max
       union=norm|raw|soft|rr  quest: how a KV head combines its query heads' bounds (ReuseConfig.quest_union)
       native=1            quest: select and read sub-block pages (Quest's granularity) instead of 64-blocks
+      carry=g             stage 5: the calibration state carries over to the next sequence (src/run_carry.py)
+      ckind=end|latch|floor  ... what carries (ReuseConfig.carry_kind);  cw=0  no warm-up once carried
+    questp:<tokens> is Quest as its paper evaluates it (token budget per query head, layers 0-1 dense).
     e.g. timer:16, oracle:0.98:32, estd:0.02:32:dh=2.5,25.3, estp:0.05:32:cal=0.3:warm=32.8,
-    quest:0.4, quest:match=estp_delta0.05_age32_cal0.3."""
+    quest:0.4, quest:match=estp_delta0.05_age32_cal0.3, questp:2048."""
     parts = spec.split(":")
     mode, pos, extra = parts[0], [], {}
     for part in parts[1:]:
@@ -97,10 +100,19 @@ def parse_cond(spec: str) -> ReuseConfig:
             extra["quest_union"] = val
         elif key == "native":
             extra["quest_native"] = val in ("1", "true", "yes")
+        elif key == "carry":
+            extra["carry"] = float(val)
+        elif key == "ckind":
+            extra["carry_kind"] = val
+        elif key == "cw":
+            extra["carry_warm"] = val in ("1", "true", "yes")
         else:
             raise ValueError(f"unknown option {key!r} in {spec!r}")
     if mode == "fresh":
         return ReuseConfig("fresh", **extra)
+    if mode == "questp":
+        extra.setdefault("dense_layers", (0, 1))
+        return ReuseConfig("questp", tokens=int(pos[0]), **extra)
     if mode in reuse.BUDGET_MODES:
         if pos:
             extra["budget"] = float(pos[0])
@@ -122,11 +134,11 @@ def meta_frac(cfg: ReuseConfig, D: int, G: int) -> float:
         block), the fp32 references lse_ref / cs_ref and centroid scores (3 G floats read or
         written), the block stats written by the attention pass and read by `update` (2 x 2 G
         floats), keep + block list (5 bytes): 2.0% for D = 128, G = 4 (1.2% with bf16 sums);
-      quest: per-channel key min and max per sub-block in bf16 (4 D bytes per sub-block): 1/sub;
+      quest / questp: per-channel key min and max per sub-block in bf16 (4 D bytes per sub-block): 1/sub;
       static / topk / fresh / V-skip / timer: none counted (topk is an oracle)."""
     if cfg.mode in ("estc", "estd", "estp", "drift", "oracle"):
         return (4 * D + 4 * 9 * G + 5) / (256 * D)
-    if cfg.mode == "quest":
+    if cfg.mode in ("quest", "questp"):
         return 1.0 / cfg.quest_sub
     return 0.0
 

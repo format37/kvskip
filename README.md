@@ -8,7 +8,8 @@ RTX 4090.
 
 Stage plans and digests (Russian): [stage 1](docs/01-decode-sparsity-digest.md) ([plan](docs/01-decode-sparsity.md)) ·
 [stage 2](docs/02-kernel-digest.md) ([plan](docs/02-kernel.md)) · [stage 3](docs/03-gate-digest.md) ([plan](docs/03-gate.md)) ·
-[stage 4](docs/04-tails-digest.md) ([plan](docs/04-tails.md)) · [post draft](docs/post-draft.md)
+[stage 4](docs/04-tails-digest.md) ([plan](docs/04-tails.md)) · [stage 5](docs/05-quest-digest.md) ([plan](docs/05-quest.md)) ·
+[post draft](docs/post-draft.md)
 
 ## What the models do: three facts
 
@@ -119,16 +120,29 @@ including each method's metadata; KL as the geometric mean over documents, worst
 | per-step oracle: best blocks by exact weight (needs all of K; not implementable) | 64% | 1.32 (1.8) |
 | Quest, 16-token pages, bounds combined over the GQA group by softmax sum (its best variant here) | 64% | 4.7 (51) |
 | Quest, 16-token min/max, 64-token loads | 64% | 12.3 (84) |
+| Quest as published: pages per query head, layers 0–1 dense (12288 tokens per query head) | 60% | 55 (89) |
 | static: the first step's best blocks, never updated (SnapKV / H2O-like) | 64% | 7.0 (28) |
 | single-pass V-skip (K read in full) | 77% | 1.19 (1.8) |
 
 The refresh policy is the best implementable method at its own operating point, and its
 stage-3 form is as good as choosing the best blocks afresh on every step. Quest depends on the
 document: its best variant beats the policy on one code file (×1.5 vs ×1.8) and loses ×17 on
-prose and ×51 on another code file. Static selection breaks at jumps. Below the operating
-point (lower top-p, threshold 1.04 − top-p) the policy degrades faster than per-step
-selection: at 40% of the bytes ×18 against Quest ×35 and the oracle ×2.9; at 30% it ties
-Quest (×61 vs ×59). Reuse is an operating-point method.
+prose and ×51 on another code file. Static selection breaks at jumps.
+
+Quest here is the published Quest (stage 5): on real decode-time q/k our selection picks
+exactly the pages Quest's own evaluation code picks (`bench/test_quest.py`), and with Quest's
+own task and protocol (passkey at 32k, 10 depths) it retrieves every key at 256–4096 tokens
+per query head, as published; so does every other method at those bytes. As published, each
+query head attends only the pages it picked, while a GQA kernel reads the union of the four
+heads' pages anyway: at equal bytes that is eight times worse than letting the KV head pick
+pages for the whole group (×458 against ×56 at 22.5% of the bytes), and the second dense layer
+costs another ×1.2. The table compares against the per-KV-head variant. A token budget is not a
+byte budget: 2048 tokens per query head is 22.5% of the K+V bytes counted this way. On the full byte scale
+(`results/figures/stage5_budget.png`) the two methods own different operating points. Below
+~40% of the bytes nothing implementable stays near bf16 (the per-step oracle itself is ×4–8 at
+20–30%), and there the refresh policy is worse than Quest's GQA variant (×168 at 20% against
+×47 at 22.5%). Reuse is an operating-point method; Quest is built to keep the task at small
+budgets, and does.
 
 **Free running at 64k** (8 documents, batch 1, each mode decoding 128 steps on its own
 tokens; KL against the exact model on the mode's own prefixes, in multiples of stock SDPA
@@ -156,7 +170,13 @@ lm_head on the CPU to fit 8 GiB of KV next to the layers.
 - No paged KV, continuous batching, CUDA graphs or prefill: this is a decode-attention study,
   not an engine.
 - The calibration is learned per sequence: a head that misbehaves rarely can still miss once
-  before it is caught (Llama code documents carry most of the remaining gap).
+  before it is caught (Llama code documents carry most of the remaining gap). Carrying it from
+  one request to the next does not fix this reliably (stage 5, 9 documents in two orders):
+  it shifts refresh times, which saved the rare offender in one order by chance and moves
+  single-step misses to other documents (×1.34 against ×1.45 over 16 document pairs; the
+  stage-3 list ×1.18).
+  The policy sees a head's real miss only on its own refresh steps, and the rare offender
+  misses between them.
 
 ## Setup
 
@@ -194,7 +214,8 @@ rebuild them from the raw downloads in `data/raw/` (not included).
 
 `./reproduce.sh N` runs stage N; `reproduce/NN-*.sh` lists each stage's commands with wall
 time and peak GPU memory on one RTX 4090. Run one GPU job at a time: the 8B at 32k peaks at
-~21 GB, the lab and free running at 64k at ~22.5 GB. Stage 4 takes about 5 hours.
+~21 GB, the lab and free running at 64k at ~22.5 GB. Stage 4 takes about 5 hours, stage 5 about
+3.5 hours.
 
 ## Layout
 
@@ -210,11 +231,12 @@ bench/
   bench_decode.py    dense: SDPA (all backends) / FA2 / kvskip, bs {1,8,32} x ctx {8k..128k}
   bench_sparse.py    sparse modes on real masks + kept-fraction sweep
   test_planner.py    device planner vs the Python planner on real q/k/v (decisions, outputs, calibration)
+  test_quest.py      our Quest selection vs Quest's own evaluation code on real q/k (stage 5)
 src/
   probe_attn.py      "probe" attention for HF transformers 5.x: fp32 decode, stats, block masking
   metrics.py         per-head stats: entropy, sink mass, blocks-to-mass, GQA union, pre-exp, reuse
-  reuse.py           block-set policies inside the probe: reuse / triggers / calibration / V-skip /
-                     Quest / static / oracle top-k
+  reuse.py           block-set policies inside the probe: reuse / triggers / calibration (and its
+                     carry-over) / V-skip / Quest (as published, GQA variants) / static / oracle top-k
   common.py          model loading, prompt building, chunked prefill, decode step
   prepare_data.py    data/docs/{prose,code,dialog}.json;  prepare_a4.py  held-out + template controls;
   prepare_s3.py      8 documents of 70k+ tokens;  make_forced.py  their teacher tokens
@@ -229,6 +251,8 @@ src/
   lab.py             layer-major lab: decode step time at bs x ctx beyond the card, KL at 64k
   run_batch_e2e.py   the real model, batched, where the KV fits (checks the lab)
   run_free.py        free-running generation at 64k (stage 4)
+  run_passkey.py     passkey retrieval with Quest's protocol (stage 5)
+  run_carry.py       documents in sequence, the calibration state carried from one to the next (stage 5)
   calibrate_heads.py the always-exact heads of a model from one diagnostic run (stage 3)
   analyze*.py        tables and figures per stage;  smoke_test.py  sdpa / eager / probe agreement
 reproduce/           one script per stage;  reproduce.sh  runs them
@@ -238,6 +262,14 @@ docs/                per-stage plan (kickoff) and digest, post draft
 ```
 
 ## Stage summaries
+
+### Stage 5 in five lines (Llama-3.1-8B, Qwen3-8B; Quest in its own regime, calibration across requests)
+
+- Our Quest is the published Quest: on real decode-time q/k it picks exactly the pages Quest's own evaluation code picks, and with Quest's own task and protocol (passkey, 32k, 10 depths) it retrieves every key at 256–4096 tokens per query head. So does every other method at those bytes: the passkey does not separate methods; the KL does (Quest ×90–1200 the noise there).
+- A token budget is not a byte budget: 2048 tokens per query head is 22.5% of the K+V bytes on a GQA model. Picking pages per query head, as published, is ×8 worse at equal bytes than per KV head (each head attends only its own pages while the kernel reads the union of four anyway), and the second dense layer ×1.2 more; stage 4 compared against the per-KV-head variant.
+- Two operating points on the full byte scale (6 documents, 15–72%): at 64% the refresh policy is within noise (×1.53) and Quest is not (×4.7 per KV head, ~×46 as published); below ~40% nothing implementable is near bf16 (the per-step oracle ×4–8 at 20–30%), and there the refresh policy is 3.5× worse than Quest per KV head.
+- Carrying the calibration from request to request (Llama 9 documents, Qwen3 6, two orders) does not replace the head list: it shifts refresh times, which saved the rare offender (5, 2) in one order by chance (a refresh moved from step 44 to 38) and moves single-step misses to other documents (×1.34 vs ×1.45 over 16 pairs; the list ×1.18). Holding each head's worst miss as a floor removes them all but makes ~70 heads exact (+8 p.p.); on Qwen3 carrying only perturbs.
+- The list's signal is not in the policy's own samples: (5, 2) shows 2 invisible losses in 132 refresh samples over 9 documents, like a dozen harmless heads. What does carry is the index latch of a head whose misses its samples see: on the passkey the policy's only bad steps are the induction head (2, 5) off the index, and with it latched they go (×14.6 → ×1.5, same bytes).
 
 ### Stage 4 in five lines (Llama-3.1-8B, Qwen3-8B, Qwen2.5-7B, Mistral-7B; decode)
 
@@ -277,6 +309,8 @@ docs/                per-stage plan (kickoff) and digest, post draft
 - [x] Stage 2: kernel (dense / masked / stats / V-skip), selection reuse, refresh trigger, perplexity, chat-template control
 - [x] Stage 3: the gate at bs 8–32 / 32k–64k (layer-major lab), planner in CUDA kernels, token index, Qwen3-8B
 - [x] Stage 4: online calibration instead of hand parameters, Quest / static / V-skip at equal bytes, Qwen2.5-7B, free running at 64k, repository for outside readers
+- [x] Stage 5: Quest checked against its own code and in its own task, the full byte scale, the calibration carried across requests, post skeleton revised
+- [ ] The post: conversation "what we looked for and what we found", then the draft from `docs/post-draft.md`
 - [ ] CUDA graph for the decode step (bs = 1); split count from the actual block lists; block 32
 - [ ] Paged-KV integration in a serving engine; prefill
 

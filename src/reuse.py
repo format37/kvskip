@@ -55,6 +55,12 @@ query heads ranked on their own normalised bound, max over the group) up to `bud
 blocks; "static" keeps the top `budget` blocks of the first decode step's exact attention
 (GQA union of per-head ranks) and never updates them (SnapKV/H2O-like). Both always read
 the sink block and the `local` newest blocks, inside the budget.
+"questp" (stage 5) is Quest as its own evaluation code runs it (mit-han-lab/Quest,
+evaluation/quest_attention.py): a fixed token budget per query head, each query head picks its
+own top pages of 16 tokens, nothing is forced in, layers 0 and 1 are dense (see quest_paper).
+
+Carry-over (stage 5): the runner can seed a sequence's calibration from earlier sequences
+(`calib_init`, `latch_init`, `calib_floor`, see ReuseConfig.carry).
 
 Every step and layer records per KV head: mass covered by the blocks actually
 used (min / mean over the G heads), the mass the stale set would have covered,
@@ -105,14 +111,27 @@ class ReuseConfig:
                                       # block's; raw = max of the raw bounds; soft = sum over the group of
                                       # softmax(bound); rr = round robin over the heads' rankings
     quest_native: bool = False        # quest: select and read quest_sub-token pages (Quest's own granularity)
+    tokens: int | None = None         # questp: token budget per query head (Quest's "token budget")
     block_frac: float | None = None   # set by the runner from the budget: blocks read per sparse layer and step
     budget_target: float | None = None
+    carry: float | None = None        # stage 5: the calibration state carries over to the next sequence
+    carry_kind: str = "end"           # end: c starts at carry * (c at the end of the previous sequence);
+                                      # latch: heads latched onto the token index stay latched, c restarts at 0;
+                                      # floor: m = max(carry * m, the sequence's worst real - estimated miss on its
+                                      # refresh steps) starts c and floors it (src/run_carry.py keeps m)
+    carry_warm: bool = True           # warm-up also on sequences that start from a carried state
+    calib_init: dict | None = field(default=None, repr=False)    # set by the runner: layer -> c [Hkv] at step 0
+    latch_init: dict | None = field(default=None, repr=False)    # layer -> bool [Hkv] latched at step 0
+    calib_floor: dict | None = field(default=None, repr=False)   # layer -> lower bound of c [Hkv]
 
     def name(self) -> str:
         if self.mode == "fresh":
             return "fresh"
         if self.mode in VSKIP_MODES:
             return f"{self.mode}_tau{self.delta:g}"
+        if self.mode == "questp":
+            return f"questp{self.tokens}" + ("" if self.dense_layers == (0, 1) else
+                                             "_dl" + ("".join(map(str, self.dense_layers)) or "none"))
         if self.mode in BUDGET_MODES:
             tag = self.mode + (f"{self.quest_sub}" if self.mode == "quest" else "")
             if self.mode == "quest" and self.quest_union != "norm":
@@ -148,6 +167,9 @@ class ReuseConfig:
                 tag += self.calib_kind
             if self.calib_auto_ix is not None:
                 tag += f"_aix{self.calib_auto_ix:g}"
+            if self.carry is not None:
+                tag += {"end": "_carry", "latch": "_latchcarry", "floor": "_floor"}[self.carry_kind]
+                tag += f"{self.carry:g}" + ("" if self.carry_warm else "_cw0")
         if self.level != 0.99:
             tag += f"_p{self.level:g}"
         if self.dense_layers != (0,):
@@ -242,14 +264,48 @@ def quest_native(cfg, records, s, p, q, k, scaling: float, layer: int, always_ro
     return torch.softmax(s.masked_fill(~tok[:, None, :], float("-inf")), dim=-1)
 
 
+def quest_paper_mask(q, k, scaling: float, tokens: int, sub: int = 16) -> torch.Tensor:
+    """The token mask Quest's evaluation code attends (mit-han-lab/Quest, evaluation/quest_attention.py,
+    the decode path of layers >= 2): K is repeated to every query head of its group, and each query
+    head takes its own top max(3, tokens // sub) pages of `sub` tokens by the bound
+    sum_d max(q_d min_d, q_d max_d), over all pages including the partial last one, nothing forced in.
+    q [Hkv, G, D], k [Hkv, T, D] -> bool [Hkv, G, T]."""
+    T = k.shape[1]
+    ub = quest_bounds(q, k, scaling, sub)                                    # [Hkv, G, nsub]
+    n = min(ub.shape[-1], max(3, tokens // sub))
+    sel = torch.zeros_like(ub, dtype=torch.bool).scatter(-1, ub.topk(n, dim=-1).indices, True)
+    return sel.repeat_interleave(sub, dim=-1)[..., :T]
+
+
+def quest_paper(cfg, records, s, p, q, k, scaling: float, layer: int, first: bool):
+    """questp: attention renormalised over each query head's own Quest pages (quest_paper_mask). `kept`
+    is the share of pages a GQA kernel reads for the KV head, the union over its G query heads."""
+    Hkv, G, T = s.shape
+    sub = cfg.quest_sub
+    tok = quest_paper_mask(q, k, scaling, cfg.tokens, sub)                  # [Hkv, G, T]
+    covered = (p * tok).sum(-1)                                              # [Hkv, G]
+    union = blocks_of(tok.any(1).float(), sub, 0.0).amax(-1)                 # [Hkv, nsub] pages read
+    zeros = torch.zeros(Hkv, device=s.device)
+    records[layer] = dict(covered_min=covered.amin(-1), covered_mean=covered.mean(-1),
+                          covered_stale_min=covered.amin(-1), kept=union.mean(-1),
+                          refresh=torch.full((Hkv,), first, dtype=torch.bool, device=s.device),
+                          drift=zeros, age=zeros, miss_c=zeros, miss_d=zeros, calib=zeros, auto_ix=zeros)
+    if bool(tok.all()):
+        return p
+    return torch.softmax(s.masked_fill(~tok, float("-inf")), dim=-1)
+
+
 def budgeted(cfg, states, records, s, p, q, k, scaling: float, layer: int, always_row):
-    """quest / static / topk at a fixed share cfg.block_frac of the blocks per KV head and step."""
+    """quest / static / topk at a fixed share cfg.block_frac of the blocks per KV head and step; questp at
+    a fixed token budget per query head."""
     Hkv, G, T = s.shape
     dev = s.device
     W = metrics.block_weights(p)                                             # [Hkv, G, nb]
     zeros = torch.zeros(Hkv, device=dev)
     first = layer not in states
     states.setdefault(layer, {})
+    if cfg.mode == "questp":
+        return quest_paper(cfg, records, s, p, q, k, scaling, layer, first)
     if cfg.mode == "quest" and cfg.quest_native:          # Quest's own pages: select and read sub-blocks
         return quest_native(cfg, records, s, p, q, k, scaling, layer, always_row, first)
     if cfg.mode == "quest":
@@ -447,7 +503,7 @@ def apply(cfg: ReuseConfig, states: dict, records: dict, s, p, q, layer: int, st
         out = vskip(cfg, states, records, s, p, layer)
         records[layer].update(diag, calib=zeros, auto_ix=zeros)
         return out
-    if cfg.mode in BUDGET_MODES:
+    if cfg.mode in BUDGET_MODES or cfg.mode == "questp":
         out = budgeted(cfg, states, records, s, p, q, k, scaling, layer, always_row)
         records[layer].update(diag)
         return out
@@ -472,6 +528,14 @@ def apply(cfg: ReuseConfig, states: dict, records: dict, s, p, q, layer: int, st
     no_heads = torch.zeros(Hkv, dtype=torch.bool, device=dev)
     calib = zeros if st is None else st["calib"]                   # [Hkv] log-odds correction (stage 4)
     auto_ix = no_heads if st is None else st["auto_ix"]            # [Hkv] latched onto the token index
+    if st is None and cfg.calib_init is not None:                  # stage 5: carried over from earlier sequences
+        calib = cfg.calib_init[layer]
+        if cfg.calib_auto_ix is not None:
+            auto_ix = calib > cfg.calib_auto_ix
+    if st is None and cfg.latch_init is not None:
+        auto_ix = auto_ix | cfg.latch_init[layer]
+    carried = cfg.calib_init is not None or cfg.latch_init is not None or cfg.calib_floor is not None
+    floor = None if cfg.calib_floor is None else cfg.calib_floor[layer]
     if cfg.calib_auto_ix is not None:
         assert idx is not None, "calib_auto_ix needs token ids"
         extra = extra | (auto_ix[:, None] & idx[None, :])
@@ -508,7 +572,7 @@ def apply(cfg: ReuseConfig, states: dict, records: dict, s, p, q, layer: int, st
         miss_dec = miss_p
         if cfg.calib is not None and step >= cfg.calib_hold:
             assert cfg.mode == "estp", "the calibration corrects the pre-pass estimate"
-            miss_dec = calib_apply(cfg, miss_p, calib)
+            miss_dec = calib_apply(cfg, miss_p, calib if floor is None else torch.maximum(calib, floor))
         if cfg.mode == "fresh":
             refresh = torch.ones(Hkv, dtype=torch.bool, device=dev)
         elif cfg.mode == "timer":
@@ -527,7 +591,7 @@ def apply(cfg: ReuseConfig, states: dict, records: dict, s, p, q, layer: int, st
             raise ValueError(cfg.mode)
         if cfg.max_age:
             age_lim = cfg.max_age
-            if cfg.calib_warm and step < cfg.calib_warm[0]:
+            if cfg.calib_warm and step < cfg.calib_warm[0] and (cfg.carry_warm or not carried):
                 age_lim = min(age_lim, cfg.calib_warm[1])
             refresh = refresh | (age >= age_lim)
         forced = [h for (l, h) in cfg.dense_heads if l == layer]

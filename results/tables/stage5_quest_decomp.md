@@ -1,0 +1,5 @@
+|                                                          |   code |   code2 |   dialog |   dialog2 |      prose |   prose2 |   geometric mean |   bytes |   top1 |
+|:---------------------------------------------------------|-------:|--------:|---------:|----------:|-----------:|---------:|-----------------:|--------:|-------:|
+| as published: own pages per query head, layers 0-1 dense |  387   |     389 |   486    |    222    |   1.54e+03 |      371 |            458   |   0.225 |  0.908 |
+| pages per KV head, layers 0-1 dense                      |   33.2 |     255 |     9.48 |      8.08 | 303        |      153 |             55.8 |   0.225 |  0.956 |
+| pages per KV head, layer 0 dense (stage 4's variant)     |   28.1 |     243 |     7.66 |      6.97 | 285        |      106 |             47.2 |   0.225 |  0.954 |
