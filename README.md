@@ -9,7 +9,7 @@ RTX 4090.
 Stage plans and digests (Russian): [stage 1](docs/01-decode-sparsity-digest.md) ([plan](docs/01-decode-sparsity.md)) ·
 [stage 2](docs/02-kernel-digest.md) ([plan](docs/02-kernel.md)) · [stage 3](docs/03-gate-digest.md) ([plan](docs/03-gate.md)) ·
 [stage 4](docs/04-tails-digest.md) ([plan](docs/04-tails.md)) · [stage 5](docs/05-quest-digest.md) ([plan](docs/05-quest.md)) ·
-[post draft](docs/post-draft.md)
+[stage 6](docs/06-paper-digest.md) (paper tables, RULER) · [post draft](docs/post-draft.md)
 
 ## What the models do: three facts
 
@@ -95,16 +95,19 @@ and over documents (worst document in parentheses).
 kernels, layer-major lab, 8 documents of 70k+ tokens, teacher-forced): the K+V blocks read
 per step (layer 0 dense included), the attention part of the step (layer time minus the
 same layer with attention returning zeros) and the whole decode step, dense kernel → policy.
+KL: mean over the 8 documents of each document's ratio (worst document).
 
 | | K+V read | attention, ms | decode step, ms (HF eager) | KL × noise |
 |---|---|---|---|---|
-| bs=8, 32k | 62% | 32.0 → 21.6 (−33%) | 57.9 → 47.5 (−18%) | 1.25 |
-| bs=32, 32k | 62% | 146.6 → 99.9 (−32%) | 172.5 → 125.9 (−27%) | 1.25 |
-| bs=8, 64k | 57% | 69.7 → 44.4 (−36%) | 95.5 → 70.2 (−26%) | 1.38 |
-| bs=32, 64k | 57% | 296.6 → 187.2 (−37%) | 322.8 → 213.3 (−34%) | 1.38 |
+| bs=8, 32k | 62% | 32.0 → 21.6 (−33%) | 57.9 → 47.5 (−18%) | 1.45 (2.4) |
+| bs=32, 32k | 62% | 146.6 → 99.9 (−32%) | 172.5 → 125.9 (−27%) | 1.45 (2.4) |
+| bs=8, 64k | 57% | 69.7 → 44.4 (−36%) | 95.5 → 70.2 (−26%) | 1.42 (2.3) |
+| bs=32, 64k | 57% | 296.6 → 187.2 (−37%) | 322.8 → 213.3 (−34%) | 1.42 (2.3) |
 
 The stage-3 policy with its hand-picked heads gives the same step times within a point
-(−19 / −27 / −28 / −35%) at KL ×1.41 / ×1.32; single-pass V-skip −15 / −20 / −25 / −29%.
+(−19 / −27 / −28 / −35%) at KL ×1.59 / ×1.36; single-pass V-skip −15 / −20 / −25 / −29%.
+(Until stage 6 this table divided the KL pooled over all documents' steps by SDPA's pooled KL:
+×1.25 / ×1.38 for the policy, ×1.41 / ×1.32 for the stage-3 policy; `paper_lab_kl` has both.)
 
 Step times are HF eager: everything outside attention costs 26 ms per step against a 16 ms
 ideal, so a tuned engine would give KV skipping a larger share of the step. At bs=1 there is
@@ -117,12 +120,12 @@ including each method's metadata; KL as the geometric mean over documents, worst
 |---|---|---|
 | refresh + online calibration (stage 4), top-p 0.99 | 64% | 1.53 (2.4) |
 | refresh + 8 always-exact heads (stage 3) | 64% | 1.32 (1.5) |
-| per-step oracle: best blocks by exact weight (needs all of K; not implementable) | 64% | 1.32 (1.8) |
+| per-step oracle: best blocks by exact weight (needs all of K; not implementable) | 64% | 1.32 (1.7) |
 | Quest, 16-token pages, bounds combined over the GQA group by softmax sum (its best variant here) | 64% | 4.7 (51) |
 | Quest, 16-token min/max, 64-token loads | 64% | 12.3 (84) |
 | Quest as published: pages per query head, layers 0–1 dense (12288 tokens per query head) | 60% | 55 (89) |
 | static: the first step's best blocks, never updated (SnapKV / H2O-like) | 64% | 7.0 (28) |
-| single-pass V-skip (K read in full) | 77% | 1.19 (1.8) |
+| single-pass V-skip (K read in full) | 77% | 1.19 (1.7) |
 
 The refresh policy is the best implementable method at its own operating point, and its
 stage-3 form is as good as choosing the best blocks afresh on every step. Quest depends on the
@@ -155,13 +158,44 @@ crept" → "had crept") rather than drifts. The lab cannot do this (it runs a de
 one layer at a time), so each document runs in the real model with the embedding table and
 lm_head on the CPU to fit 8 GiB of KV next to the layers.
 
+**Task accuracy: RULER at 32k** (stage 6; Llama-3.1-8B-Instruct, NVIDIA RULER at commit c3f5e3b,
+five tasks × 50 samples; the question goes through the sparse decode path, as in Quest's passkey
+evaluation, and each method answers on its own; RULER's metric × 100; KL on the question tokens,
+geometric mean over samples):
+
+| method | K+V bytes | multi-key | multi-value | var. tracking | freq. words | QA | average | KL × noise |
+|---|---|---|---|---|---|---|---|---|
+| exact (fp32) | 100% | 100 | 99.5 | 98.0 | 87.3 | 72 | 91.4 | – |
+| stock bf16 SDPA | 100% | 100 | 99.5 | 98.0 | 89.3 | 74 | 92.2 | 1 |
+| refresh + online calibration (stage 4) | 78% | 100 | 99.5 | 98.8 | 86.7 | 74 | 91.8 | 2.05 |
+| + induction head (2, 5) on the token index from step 0 | 78% | 100 | 99.5 | 98.8 | 87.3 | 76 | 92.3 | 1.60 |
+| Quest, pages per KV head, same bytes | 78% | 100 | 100 | 98.0 | 87.3 | 76 | 92.3 | 1.86 |
+| per-step oracle, same bytes | 78% | 100 | 99.5 | 98.0 | 86.7 | 74 | 91.6 | 1.21 |
+| Quest as published, 2048 tokens per query head | 23% | 70 | 98 | 92.0 | 89.3 | 62 | 82.3 | 449 |
+| Quest, pages per KV head, same bytes | 23% | 100 | 99.5 | 98.0 | 82.7 | 76 | 91.2 | 42 |
+| per-step oracle, same bytes | 23% | 98 | 99.5 | 98.8 | 83.3 | 74 | 90.7 | 23 |
+| refresh + calibration, top-p 0.2 | 25% | 88 | 83 | 74.8 | 80.7 | 68 | 78.9 | 349 |
+
+At the policy's operating point no method loses accuracy: the policy is 0.4 points above the
+exact model (95% bootstrap interval −0.6 to +1.7). It reads 78% of the K+V bytes rather than
+the documents' 64%, mostly because its sets are larger here: on steps without a refresh they
+skip 23–32% of the blocks, against 34–60% on the documents. On the question tokens Quest per KV
+head is slightly closer to exact than the policy (paired ×1.11, 1.03–1.19), most on variable
+tracking; with the induction head latched from the first step the policy is closer (×0.86).
+At a quarter of the bytes RULER separates the methods: Quest as published loses 9.1 points
+(−13.0 to −5.3; multi-key needles 70 against 100, QA 62 against 72), Quest with pages per KV
+head keeps the accuracy although its KL is ×42, and the refresh policy at its lowest level loses
+12.5 points. The task is the weaker test: KL separates methods that RULER does not.
+
 ## Limitations
 
 - One GPU, four ~8B models (the kernels and the gate on Llama-3.1-8B only), 6–8 documents
   per measurement, 128 decode steps each. The mean KL is tail-dominated: one step of one
   head can move it several-fold.
 - Quality is mostly teacher-forced KL against an fp32 reference; perplexity over 2k tokens
-  (stage 2) and free running at 64k (stage 4) are the checks beyond it.
+  (stage 2), free running at 64k (stage 4) and five RULER tasks at 32k on Llama-3.1-8B
+  (stage 6, 50 samples each) are the checks beyond it. The policy's design was chosen on the
+  same documents it is evaluated on; a larger unseen document set is the next check.
 - The step times at bs ≥ 8 come from the layer-major lab, which composes a step from real
   HF layer calls on real data; it matches the real model where both fit (±2%) and
   overestimates CPU-bound configurations.
@@ -215,7 +249,7 @@ rebuild them from the raw downloads in `data/raw/` (not included).
 `./reproduce.sh N` runs stage N; `reproduce/NN-*.sh` lists each stage's commands with wall
 time and peak GPU memory on one RTX 4090. Run one GPU job at a time: the 8B at 32k peaks at
 ~21 GB, the lab and free running at 64k at ~22.5 GB. Stage 4 takes about 5 hours, stage 5 about
-3.5 hours.
+3.5 hours, stage 6 (RULER) about 6.5 hours.
 
 ## Layout
 
@@ -253,8 +287,9 @@ src/
   run_free.py        free-running generation at 64k (stage 4)
   run_passkey.py     passkey retrieval with Quest's protocol (stage 5)
   run_carry.py       documents in sequence, the calibration state carried from one to the next (stage 5)
+  run_ruler.py       RULER at 32k with the question through the sparse decode path (stage 6)
   calibrate_heads.py the always-exact heads of a model from one diagnostic run (stage 3)
-  analyze*.py        tables and figures per stage;  smoke_test.py  sdpa / eager / probe agreement
+  analyze*.py        tables and figures per stage (analyze_paper.py: the paper's);  smoke_test.py  sdpa / eager / probe agreement
 reproduce/           one script per stage;  reproduce.sh  runs them
 data/docs/           exact inputs (kept in git); data/raw and data/kv_dumps are gitignored
 results/             figures and tables are kept; raw parquet/json is regenerated
@@ -262,6 +297,14 @@ docs/                per-stage plan (kickoff) and digest, post draft
 ```
 
 ## Stage summaries
+
+### Stage 6 in five lines (the paper's tables and figures; RULER on Llama-3.1-8B at 32k)
+
+- RULER at 32k (5 tasks × 50 samples, both operating points): at the policy's 78% of the bytes no method loses accuracy (the policy +0.4 points, 95% interval −0.6 to +1.7); at a quarter of the bytes Quest per KV head keeps it (−0.1), Quest as published loses 9.1 and the policy at top-p 0.2 loses 12.5. Stage 5's two operating points, now on a task.
+- On RULER's question tokens Quest per KV head is slightly closer to exact than the policy (KL ×1.11, 1.03–1.19), most on variable tracking; with the induction head (2, 5) latched from the first step the policy is closer (×0.86). The higher bytes come mostly from larger sets on RULER (23–32% of the blocks skipped without a refresh, 34–60% on the documents), not from the short-answer warm-up.
+- The paper's tables and figures come from one script (`src/analyze_paper.py`, a minute on CPU, byte-identical on re-run): bootstrap intervals over documents; exact paired tests (Quest per KV head worse than the policy on 5 of 6 documents, p = 0.06; static and Quest as published on 6 of 6, p = 0.03); timers at equal bytes (every 4 steps ×1.99 against ×1.54 for the calibrated trigger at 63–64% of the bytes, 32k).
+- The failures of the trigger alone at 16k are almost all the induction head (2, 5) (33 of 39 low-coverage head-steps on prose, 4 of 4 on code, 19 of 21 on dialog). An adaptive per-step oracle (exactly 99% of each query head's mass) reaches ×1.31 at ~50% of the blocks: exact adaptive selection would save more than reuse does.
+- Numbers corrected while writing: the lab's KL is now the per-document mean (×1.45 / ×1.42 at 32k / 64k, worst 2.4 / 2.3), not KL pooled over all documents (×1.25 / ×1.38); the cost of dropping the tail beyond 90% is ×10.3–10.4 (not ×10.5); stock SDPA's earliest greedy divergence from fp32 is step 35 (step 7 was eager's); a few roundings.
 
 ### Stage 5 in five lines (Llama-3.1-8B, Qwen3-8B; Quest in its own regime, calibration across requests)
 
@@ -310,6 +353,7 @@ docs/                per-stage plan (kickoff) and digest, post draft
 - [x] Stage 3: the gate at bs 8–32 / 32k–64k (layer-major lab), planner in CUDA kernels, token index, Qwen3-8B
 - [x] Stage 4: online calibration instead of hand parameters, Quest / static / V-skip at equal bytes, Qwen2.5-7B, free running at 64k, repository for outside readers
 - [x] Stage 5: Quest checked against its own code and in its own task, the full byte scale, the calibration carried across requests, post skeleton revised
+- [x] Stage 6: RULER at 32k at both operating points, the paper's tables and figures (`src/analyze_paper.py`), every number checked against the tables
 - [ ] The post: conversation "what we looked for and what we found", then the draft from `docs/post-draft.md`
 - [ ] CUDA graph for the decode step (bs = 1); split count from the actual block lists; block 32
 - [ ] Paged-KV integration in a serving engine; prefill
